@@ -21,3 +21,4 @@ pub mod spend;
 pub mod spendable;
 pub mod stamp;
 pub mod summary;
+pub mod wire;
