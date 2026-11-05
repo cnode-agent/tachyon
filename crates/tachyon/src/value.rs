@@ -37,7 +37,7 @@ const VALUE_COMMITMENT_DOMAIN: &str = "z.cash:Orchard-cv";
 
 lazy_static! {
     /// Generator $\mathcal{V}$ for value commitments.
-    static ref VALUE_COMMIT_V: Ep = {
+    pub(crate) static ref VALUE_COMMIT_V: Ep = {
         #[expect(clippy::expect_used, reason = "the fixed generator has a canonical encoding")]
         EpAffine::from_bytes(Point::hash_to_curve(VALUE_COMMITMENT_DOMAIN)(b"v").to_bytes())
             .expect("valid Orchard generator")
@@ -45,7 +45,7 @@ lazy_static! {
     };
 
     /// Generator $\mathcal{R}$ for value commitments and binding signatures.
-    static ref VALUE_COMMIT_R: Ep = {
+    pub(crate) static ref VALUE_COMMIT_R: Ep = {
         #[expect(clippy::expect_used, reason = "the fixed generator has a canonical encoding")]
         EpAffine::from_bytes(Point::hash_to_curve(VALUE_COMMITMENT_DOMAIN)(b"r").to_bytes())
             .expect("valid Orchard generator")
@@ -284,6 +284,30 @@ mod tests {
     #[test]
     fn balance_zero_is_identity() {
         assert_eq!(Trapdoor::ZERO.commit(Balance::ZERO), Commitment::default());
+    }
+
+    #[test]
+    fn value_commitment_matches_legacy_orchard_generators_and_scalar_bytes() {
+        use ff::PrimeField as _;
+        use group::Curve as _;
+        use pasta_curves::Fq as LegacyFq;
+
+        const LEGACY_VALUE_COMMITMENT_DOMAIN: &str = "z.cash:Orchard-cv";
+
+        let trapdoor = Trapdoor::from_scalar(Fq::from(29));
+        let value = Balance::try_from(-11).unwrap();
+        let current_bytes: [u8; 32] = trapdoor.commit(value).into();
+        let legacy_randomness = LegacyFq::from_repr(trapdoor.0.to_bytes())
+            .into_option()
+            .expect("canonical Udon randomness bytes decode in legacy Fq");
+        let legacy_value = -LegacyFq::from(11u64);
+        let legacy_value_generator = Point::hash_to_curve(LEGACY_VALUE_COMMITMENT_DOMAIN)(b"v");
+        let legacy_randomness_generator =
+            Point::hash_to_curve(LEGACY_VALUE_COMMITMENT_DOMAIN)(b"r");
+        let legacy_commitment =
+            legacy_value_generator * legacy_value + legacy_randomness_generator * legacy_randomness;
+
+        assert_eq!(legacy_commitment.to_affine().to_bytes(), current_bytes);
     }
 
     /// The binding property: `cv_a + cv_b - balance(a+b) = [rcv_a + rcv_b]R`.

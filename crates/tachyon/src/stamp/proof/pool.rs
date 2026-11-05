@@ -18,157 +18,34 @@
 //! anchor endpoints belong to the published per-block anchor sequence.
 
 #![allow(clippy::module_name_repetitions, reason = "intentional names")]
-
 extern crate alloc;
-
-use alloc::{vec, vec::Vec};
-
-use ragu::{Header, Index, Step, Suffix};
-use ragu_core::{Cycle as _, FixedGenerators as _, pasta::Pasta};
-
-use super::{
-    delegation::NoteNullifiers,
-    qr::{QrBucket, enforce_value_profile},
+use ragu::{Encoded, Header, Index, Step, StepCtx, pasta::Eq};
+use ragu_core::{
+    drivers::{Driver, DriverValue},
+    gadgets::Bound,
+    maybe::Maybe as _,
 };
+use ragu_primitives::{Element, GadgetExt as _};
+use udon::{curve::Projective as _, field::Field as _};
+
+use super::{delegation::NoteNullifiers, qr::QrBucket};
 use crate::{
-    collections::indexed_multiset,
-    note::{self},
-    pasta,
-    pasta::{Ep, Eq, Fp, Fq},
+    gadgets::arithmetic as circuit,
+    pasta::Fp,
     primitives::{
-        Anchor, AnchorSetCommit, AnchorSetPoly, EpochIndex, NfSeqCommit, NfSeqPoly, QrClassRoot,
-        QrProfile, Tachygram, TachygramSetCommit, TachygramSetPoly,
+        Anchor, AnchorSetPoly, EpochIndex, NfSeqPoly, QrClassRoot, QrProfile, Tachygram,
+        TachygramSetCommit, TachygramSetPoly,
     },
-    ragu_constraint::{enforce_equal_point, enforce_nonzero, enforce_zero},
-    relations::enforce::enforce_poly_product,
+    relations::enforce::{
+        bind_poly_handle, enforce_poly_product, indexed_member_factor, poly_handle_limbs,
+    },
 };
-
-/// Multi-stamp / multi-epoch nf-exclusion proof over arbitrary values.
-///
-/// The tested values are arbitrary field elements until [`UnspentBind`]
-/// attributes them to a note's derivation. No step producing one touches a
-/// note, `cm`, or `mk`, so the segment is safe to delegate.
-///
-/// A segment covers whole epochs, half-open on both axes:
-/// `[anchor_start, anchor_next)` and `[epoch_start, epoch_next)`.
-/// `anchor_start` is the entry anchor of `epoch_start`, and `anchor_next` is
-/// the entry anchor of `epoch_next`. It starts at
-/// [`QrUnspentInit`](super::qr::QrUnspentInit) over one epoch's [`QrBucket`],
-/// [`UnspentLift`] appends the next epoch's bucket, and [`UnspentFuse`] joins
-/// segments on a shared boundary. Each producer takes an anchor bound and its
-/// epoch from the same bucket or the same half, and
-/// [`QrBucketSeal`](super::qr::QrBucketSeal) gives every bucket that form.
-///
-/// An `elapsed` [`NfSeqPoly`] holds one tested nullifier per epoch in
-/// `[epoch_start, epoch_next)`. `epoch_next`'s nullifier is the next segment's
-/// to test, or [`SpendBind`](super::spend::SpendBind)'s once a spendable rests
-/// on `anchor_next`.
-///
-/// Every producer maintains the provenance [`UnspentBind`]'s completeness
-/// argument leans on. Each member's epoch lies in `[epoch_start, epoch_next)`,
-/// because `QrUnspentInit` and [`UnspentLift`] encode their member from the
-/// bucket's own epoch. Each epoch carries exactly one member: `QrUnspentInit`
-/// pins its one member by its challenge identity, `UnspentLift` adds exactly
-/// one at `epoch_next` by its, and [`UnspentFuse`]'s identity determines the
-/// combined polynomial exactly, so the property composes by induction.
-#[derive(Clone, Debug)]
-pub struct ArbitraryUnspent;
-
-impl Header for ArbitraryUnspent {
-    /// `(anchor_start, epoch_start, elapsed, epoch_next, anchor_next)`
-    type Data = (Anchor, EpochIndex, NfSeqCommit, EpochIndex, Anchor);
-
-    const SUFFIX: Suffix = Suffix::new(1);
-
-    fn encode(data: &Self::Data) -> (Vec<Fp>, Vec<Fq>, Vec<Ep>, Vec<Eq>) {
-        let (anchor_start, epoch_start, elapsed, epoch_next, anchor_next) = *data;
-        (
-            vec![
-                Fp::from(anchor_start),
-                Fp::from(epoch_start),
-                Fp::from(epoch_next),
-                Fp::from(anchor_next),
-            ],
-            Vec::new(),
-            Vec::new(),
-            vec![Eq::from(elapsed)],
-        )
-    }
-}
-
-/// A note proven unspent across a span: an [`ArbitraryUnspent`] whose values
-/// [`UnspentBind`] has attributed to the note's genuine derivation.
-#[derive(Clone, Debug)]
-pub struct NoteUnspent;
-
-impl Header for NoteUnspent {
-    /// `(cm, anchor_start, epoch_start, epoch_next, anchor_next)`. `cm` leads;
-    /// the rest mirrors the [`ArbitraryUnspent`] without `elapsed`.
-    type Data = (note::Commitment, Anchor, EpochIndex, EpochIndex, Anchor);
-
-    const SUFFIX: Suffix = Suffix::new(3);
-
-    fn encode(data: &Self::Data) -> (Vec<Fp>, Vec<Fq>, Vec<Ep>, Vec<Eq>) {
-        let (cm, anchor_start, epoch_start, epoch_next, anchor_next) = *data;
-        (
-            vec![
-                Fp::from(cm),
-                Fp::from(anchor_start),
-                Fp::from(epoch_start),
-                Fp::from(epoch_next),
-                Fp::from(anchor_next),
-            ],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )
-    }
-}
-
-/// An anchor path with a commitment to the anchors inside it.
-///
-/// `members` commits to a polynomial with one root for each stamp folded into
-/// the span. The root is the anchor that fold produces. `anchor_end` is a
-/// member and `anchor_start` is not. [`super::stamp::StampLift`] uses spans to
-/// advance a stamp's anchor. A spendable's anchor advances through
-/// [`ArbitraryUnspent`], whose steps prove the note's nullifiers absent.
-///
-/// A span stays within one epoch. [`AnchorSpanSeed`] folds only with
-/// [`Anchor::next_stamp`], which hashes under the `Tachyon-AnchorSt` domain.
-/// Entering the next epoch takes [`Anchor::next_epoch`], which hashes under
-/// `Tachyon-AnchorEp`. Among the proof steps, only
-/// [`QrBucketSeal`](super::qr::QrBucketSeal) computes it. Consensus also
-/// rejects a tachygram published twice within two epochs. That check catches a
-/// tachygram already published earlier in the epoch a stamp is lifted across.
-///
-/// [`AnchorSpanSeed`] takes `anchor_start` as a free witness. A span on its own
-/// is not tied to the published chain. Consensus ties it when it checks the
-/// anchor of the stamp that [`super::stamp::StampLift`] outputs.
-#[derive(Clone, Debug)]
-pub struct AnchorSpan;
-
-impl Header for AnchorSpan {
-    /// `(anchor_start, members, anchor_end)`
-    type Data = (Anchor, AnchorSetCommit, Anchor);
-
-    const SUFFIX: Suffix = Suffix::new(14);
-
-    fn encode(data: &Self::Data) -> (Vec<Fp>, Vec<Fq>, Vec<Ep>, Vec<Eq>) {
-        let (anchor_start, members, anchor_end) = *data;
-        (
-            vec![Fp::from(anchor_start), Fp::from(anchor_end)],
-            Vec::new(),
-            Vec::new(),
-            vec![Eq::from(members)],
-        )
-    }
-}
 
 /// Start an [`AnchorSpan`] from one stamp.
 ///
 /// The step folds the stamp into `anchor_start` with [`Anchor::next_stamp`].
 /// The span's only member is the resulting anchor, committed with
-/// [`AnchorSetCommit::singleton`].
+/// [`AnchorSetCommit::singleton`](crate::primitives::AnchorSetCommit::singleton).
 ///
 /// # Soundness
 ///
@@ -183,29 +60,79 @@ impl Step for AnchorSpanSeed {
     type Left = ();
     type Output = AnchorSpan;
     type Right = ();
-    /// `(anchor_start, epoch, stamp_commit)`
-    type Witness<'source> = (Anchor, EpochIndex, TachygramSetCommit);
+    type Shared = ();
+    /// `(anchor_start, epoch, stamp_commit, members)`; `members` is witnessed
+    /// off circuit and pinned to exactly `X - anchor_end` by a challenge query.
+    type Witness<'source> = (Anchor, EpochIndex, TachygramSetCommit, AnchorSetPoly);
 
     const INDEX: Index = Index::new(31);
 
-    fn witness<'source>(
+    fn witness<'dr, 'source: 'dr, D: Driver<'dr, F = Fp>, const HEADER_SIZE: usize>(
         &self,
-        _ctx: &mut ragu::StepCtx<'_>,
-        (anchor_start, epoch, stamp_commit): Self::Witness<'source>,
-        _left: <Self::Left as Header>::Data,
-        _right: <Self::Right as Header>::Data,
-    ) -> ragu_core::Result<(<Self::Output as Header>::Data, Self::Aux<'source>)> {
-        let anchor_end = anchor_start
-            .next_stamp(epoch, &stamp_commit)
-            .map_err(|_e| ragu_core::Error::InvalidWitness("invalid anchor step".into()))?;
+        ctx: &mut StepCtx<'_, 'dr, D>,
+        witness: DriverValue<D, Self::Witness<'source>>,
+        left: DriverValue<D, <Self::Left as Header>::Data>,
+        right: DriverValue<D, <Self::Right as Header>::Data>,
+    ) -> ragu_core::Result<(
+        (
+            Encoded<'dr, D, Self::Left, HEADER_SIZE>,
+            Encoded<'dr, D, Self::Right, HEADER_SIZE>,
+            Encoded<'dr, D, Self::Output, HEADER_SIZE>,
+        ),
+        Bound<'dr, D, Self::Shared>,
+        DriverValue<D, <Self::Output as Header>::Data>,
+        DriverValue<D, Self::Aux<'source>>,
+    )>
+    where
+        Self: 'dr,
+    {
+        let left_encoded = Encoded::<D, Self::Left, HEADER_SIZE>::new(ctx.dr, &mut (), left)?;
+        let right_encoded = Encoded::<D, Self::Right, HEADER_SIZE>::new(ctx.dr, &mut (), right)?;
+        let previous = Element::alloc(
+            ctx.dr,
+            &mut (),
+            witness.as_ref().map(|data| Fp::from(data.0)),
+        )?;
+        let epoch_element = Element::alloc(
+            ctx.dr,
+            &mut (),
+            witness.as_ref().map(|data| Fp::from(data.1)),
+        )?;
+        let limbs = crate::gadgets::commitment::HostCommitment::alloc(
+            ctx.dr,
+            &mut (),
+            witness.as_ref().map(|data| Eq::from(data.2).to_affine()),
+        )
+        .map(|encoding| encoding.limbs)?;
+        let anchor_element = crate::gadgets::anchor::AnchorGadget::from(previous.clone())
+            .next_stamp(ctx.dr, epoch_element, limbs)
+            .map(|anchor| anchor.element)?;
+        let members_handle =
+            ctx.witness_polynomial(witness.as_ref().map(|data| data.3.as_ref().clone()))?;
+        let members_limbs = poly_handle_limbs(ctx.dr, &members_handle)?;
+        let challenge = ctx.derive_challenge(&(members_limbs, anchor_element.clone()))?;
+        let evaluation = challenge.sub(ctx.dr, &anchor_element);
+        ctx.enforce_poly_query(&members_handle, challenge, evaluation)?;
+        let output = D::try_just(|| {
+            let (anchor_start, _, _, members) = witness.take();
+            let anchor_end = Anchor::from(*anchor_element.value().take());
 
+            Ok(((anchor_start, members.commit(), anchor_end), ()))
+        })?;
+        let (data, aux) = output.cast();
+        let fields = crate::stamp::headers::pool::AnchorSpanOutput {
+            anchor_start: (previous).into(),
+            anchor_end: (anchor_element).into(),
+            members: (crate::gadgets::commitment::HostCommitment {
+                limbs: poly_handle_limbs(ctx.dr, &members_handle)?,
+            })
+            .into(),
+        };
         Ok((
-            (
-                anchor_start,
-                AnchorSetCommit::singleton(anchor_end),
-                anchor_end,
-            ),
+            (left_encoded, right_encoded, Encoded::from_gadget(fields)),
             (),
+            data,
+            aux,
         ))
     }
 }
@@ -230,41 +157,90 @@ impl Step for AnchorSpanFuse {
     type Left = AnchorSpan;
     type Output = AnchorSpan;
     type Right = AnchorSpan;
+    type Shared = ();
     /// `(left_members, combined, right_members)`
     type Witness<'source> = (AnchorSetPoly, AnchorSetPoly, AnchorSetPoly);
 
     const INDEX: Index = Index::new(32);
 
-    fn witness<'source>(
+    fn witness<'dr, 'source: 'dr, D: Driver<'dr, F = Fp>, const HEADER_SIZE: usize>(
         &self,
-        ctx: &mut ragu::StepCtx<'_>,
-        (left_members, combined, right_members): Self::Witness<'source>,
-        (left_anchor_start, left_members_commit, left_anchor_end): <Self::Left as Header>::Data,
-        (right_anchor_start, right_members_commit, right_anchor_end): <Self::Right as Header>::Data,
-    ) -> ragu_core::Result<(<Self::Output as Header>::Data, Self::Aux<'source>)> {
-        enforce_zero(
-            Fp::from(left_anchor_end) - Fp::from(right_anchor_start),
-            "AnchorSpanFuse: spans do not share a vertex",
-        )?;
-        enforce_equal_point(
-            Eq::from(left_members.commit()),
-            Eq::from(left_members_commit),
+        ctx: &mut StepCtx<'_, 'dr, D>,
+        witness: DriverValue<D, Self::Witness<'source>>,
+        left: DriverValue<D, <Self::Left as Header>::Data>,
+        right: DriverValue<D, <Self::Right as Header>::Data>,
+    ) -> ragu_core::Result<(
+        (
+            Encoded<'dr, D, Self::Left, HEADER_SIZE>,
+            Encoded<'dr, D, Self::Right, HEADER_SIZE>,
+            Encoded<'dr, D, Self::Output, HEADER_SIZE>,
+        ),
+        Bound<'dr, D, Self::Shared>,
+        DriverValue<D, <Self::Output as Header>::Data>,
+        DriverValue<D, Self::Aux<'source>>,
+    )>
+    where
+        Self: 'dr,
+    {
+        let left_encoded =
+            Encoded::<D, Self::Left, HEADER_SIZE>::new(ctx.dr, &mut (), left.clone())?;
+        let right_encoded =
+            Encoded::<D, Self::Right, HEADER_SIZE>::new(ctx.dr, &mut (), right.clone())?;
+        let left_end = left_encoded.as_gadget().anchor_end.element.clone();
+        let right_start = right_encoded.as_gadget().anchor_start.element.clone();
+        left_end
+            .enforce_equal(ctx.dr, &right_start)
+            .map_err(|_err| {
+                ragu_core::Error::InvalidWitness(
+                    "AnchorSpanFuse: spans do not share a vertex".into(),
+                )
+            })?;
+        let left_handle =
+            ctx.witness_polynomial(witness.as_ref().map(|members| members.0.as_ref().clone()))?;
+        let combined_handle =
+            ctx.witness_polynomial(witness.as_ref().map(|members| members.1.as_ref().clone()))?;
+        let right_handle =
+            ctx.witness_polynomial(witness.as_ref().map(|members| members.2.as_ref().clone()))?;
+        bind_poly_handle(
+            ctx,
+            &left_handle,
+            &left_encoded.as_gadget().members.encoding.limbs,
             "AnchorSpanFuse: left members do not match header",
         )?;
-        enforce_equal_point(
-            Eq::from(right_members.commit()),
-            Eq::from(right_members_commit),
+        bind_poly_handle(
+            ctx,
+            &right_handle,
+            &right_encoded.as_gadget().members.encoding.limbs,
             "AnchorSpanFuse: right members do not match header",
         )?;
         enforce_poly_product(
             ctx,
-            left_members.as_ref(),
-            right_members.as_ref(),
-            combined.as_ref(),
+            &left_handle,
+            &right_handle,
+            &combined_handle,
             "AnchorSpanFuse: combined is not the union of the halves",
         )?;
-
-        Ok(((left_anchor_start, combined.commit(), right_anchor_end), ()))
+        let output = D::try_just(|| {
+            let (_, combined, _) = witness.take();
+            let (left_anchor_start, ..) = left.take();
+            let (_, _, right_anchor_end) = right.take();
+            Ok(((left_anchor_start, combined.commit(), right_anchor_end), ()))
+        })?;
+        let (data, aux) = output.cast();
+        let fields = crate::stamp::headers::pool::AnchorSpanOutput {
+            anchor_start: (left_encoded.as_gadget().anchor_start.element.clone()).into(),
+            anchor_end: (right_encoded.as_gadget().anchor_end.element.clone()).into(),
+            members: (crate::gadgets::commitment::HostCommitment {
+                limbs: poly_handle_limbs(ctx.dr, &combined_handle)?,
+            })
+            .into(),
+        };
+        Ok((
+            (left_encoded, right_encoded, Encoded::from_gadget(fields)),
+            (),
+            data,
+            aux,
+        ))
     }
 }
 
@@ -282,52 +258,118 @@ impl Step for UnspentFuse {
     type Left = ArbitraryUnspent;
     type Output = ArbitraryUnspent;
     type Right = ArbitraryUnspent;
+    type Shared = ();
     /// `(left_elapsed_seq, combined_elapsed_seq, right_elapsed_seq)`
     type Witness<'source> = (NfSeqPoly, NfSeqPoly, NfSeqPoly);
 
     const INDEX: Index = Index::new(2);
 
-    fn witness<'source>(
+    fn witness<'dr, 'source: 'dr, D: Driver<'dr, F = Fp>, const HEADER_SIZE: usize>(
         &self,
-        ctx: &mut ragu::StepCtx<'_>,
-        (left_elapsed_seq, combined_elapsed_seq, right_elapsed_seq): Self::Witness<'source>,
-        (left_anchor_start, left_epoch_start, left_elapsed, left_epoch_next, left_anchor_next): <Self::Left as Header>::Data,
-        (right_anchor_start, right_epoch_start, right_elapsed, right_epoch_next, right_anchor_next): <Self::Right as Header>::Data,
-    ) -> ragu_core::Result<(<Self::Output as Header>::Data, Self::Aux<'source>)> {
-        enforce_equal_point(
-            Eq::from(left_elapsed_seq.commit()),
-            Eq::from(left_elapsed),
+        ctx: &mut StepCtx<'_, 'dr, D>,
+        witness: DriverValue<D, Self::Witness<'source>>,
+        left: DriverValue<D, <Self::Left as Header>::Data>,
+        right: DriverValue<D, <Self::Right as Header>::Data>,
+    ) -> ragu_core::Result<(
+        (
+            Encoded<'dr, D, Self::Left, HEADER_SIZE>,
+            Encoded<'dr, D, Self::Right, HEADER_SIZE>,
+            Encoded<'dr, D, Self::Output, HEADER_SIZE>,
+        ),
+        Bound<'dr, D, Self::Shared>,
+        DriverValue<D, <Self::Output as Header>::Data>,
+        DriverValue<D, Self::Aux<'source>>,
+    )>
+    where
+        Self: 'dr,
+    {
+        let left_encoded =
+            Encoded::<D, Self::Left, HEADER_SIZE>::new(ctx.dr, &mut (), left.clone())?;
+        let right_encoded =
+            Encoded::<D, Self::Right, HEADER_SIZE>::new(ctx.dr, &mut (), right.clone())?;
+        let left_anchor = left_encoded.as_gadget().anchor_next.element.clone();
+        let right_anchor = right_encoded.as_gadget().anchor_start.element.clone();
+        left_anchor
+            .enforce_equal(ctx.dr, &right_anchor)
+            .map_err(|_err| {
+                ragu_core::Error::InvalidWitness(
+                    "UnspentFuse: left.anchor_next must equal right.anchor_start".into(),
+                )
+            })?;
+        let left_epoch = left_encoded.as_gadget().epoch_next.element.clone();
+        let right_epoch = right_encoded.as_gadget().epoch_start.element.clone();
+        left_epoch
+            .enforce_equal(ctx.dr, &right_epoch)
+            .map_err(|_err| {
+                ragu_core::Error::InvalidWitness(
+                    "UnspentFuse: halves do not meet at one epoch".into(),
+                )
+            })?;
+        let left_handle = ctx.witness_polynomial(
+            witness
+                .as_ref()
+                .map(|sequences| sequences.0.as_ref().clone()),
+        )?;
+        let combined_handle = ctx.witness_polynomial(
+            witness
+                .as_ref()
+                .map(|sequences| sequences.1.as_ref().clone()),
+        )?;
+        let right_handle = ctx.witness_polynomial(
+            witness
+                .as_ref()
+                .map(|sequences| sequences.2.as_ref().clone()),
+        )?;
+        bind_poly_handle(
+            ctx,
+            &left_handle,
+            &left_encoded.as_gadget().elapsed.encoding.limbs,
             "UnspentFuse: left polynomial does not match header",
         )?;
-        enforce_equal_point(
-            Eq::from(right_elapsed_seq.commit()),
-            Eq::from(right_elapsed),
+        bind_poly_handle(
+            ctx,
+            &right_handle,
+            &right_encoded.as_gadget().elapsed.encoding.limbs,
             "UnspentFuse: right polynomial does not match header",
-        )?;
-        enforce_zero(
-            Fp::from(left_anchor_next) - Fp::from(right_anchor_start),
-            "UnspentFuse: left.anchor_next must equal right.anchor_start",
-        )?;
-        enforce_zero(
-            Fp::from(right_epoch_start) - Fp::from(left_epoch_next),
-            "UnspentFuse: halves do not meet at one epoch",
         )?;
         enforce_poly_product(
             ctx,
-            left_elapsed_seq.as_ref(),
-            right_elapsed_seq.as_ref(),
-            combined_elapsed_seq.as_ref(),
+            &left_handle,
+            &right_handle,
+            &combined_handle,
             "UnspentFuse: combined is not the concatenation of the halves",
         )?;
+        let output = D::try_just(|| {
+            let (_left_elapsed_seq, combined_elapsed_seq, _right_elapsed_seq) = witness.take();
+            let (left_anchor_start, left_epoch_start, ..) = left.take();
+            let (_, _, _, right_epoch_next, right_anchor_next) = right.take();
+            Ok((
+                (
+                    left_anchor_start,
+                    left_epoch_start,
+                    combined_elapsed_seq.commit(),
+                    right_epoch_next,
+                    right_anchor_next,
+                ),
+                (),
+            ))
+        })?;
+        let (data, aux) = output.cast();
+        let fields = crate::stamp::headers::pool::ArbitraryUnspentOutput {
+            anchor_start: (left_encoded.as_gadget().anchor_start.element.clone()).into(),
+            epoch_start: (left_encoded.as_gadget().epoch_start.element.clone()).into(),
+            epoch_next: (right_encoded.as_gadget().epoch_next.element.clone()).into(),
+            anchor_next: (right_encoded.as_gadget().anchor_next.element.clone()).into(),
+            elapsed: (crate::gadgets::commitment::HostCommitment {
+                limbs: poly_handle_limbs(ctx.dr, &combined_handle)?,
+            })
+            .into(),
+        };
         Ok((
-            (
-                left_anchor_start,
-                left_epoch_start,
-                combined_elapsed_seq.commit(),
-                right_epoch_next,
-                right_anchor_next,
-            ),
+            (left_encoded, right_encoded, Encoded::from_gadget(fields)),
             (),
+            data,
+            aux,
         ))
     }
 }
@@ -352,8 +394,6 @@ impl Step for UnspentFuse {
 /// advances by one, so `extended` keeps one member per epoch in
 /// `[epoch_start, epoch_next)`. `value` is free until
 /// [`UnspentBind`] forces it against the note's derivation.
-///
-/// Three committed polynomials, each opened once.
 #[derive(Debug)]
 pub struct UnspentLift;
 
@@ -362,6 +402,7 @@ impl Step for UnspentLift {
     type Left = ArbitraryUnspent;
     type Output = ArbitraryUnspent;
     type Right = QrBucket;
+    type Shared = ();
     /// `(value, classes, mask, elapsed_seq, extended_seq, contents)`
     type Witness<'source> = (
         Tachygram,
@@ -374,90 +415,192 @@ impl Step for UnspentLift {
 
     const INDEX: Index = Index::new(24);
 
-    fn witness<'source>(
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the step handles three checked polynomial openings"
+    )]
+    fn witness<'dr, 'source: 'dr, D: Driver<'dr, F = Fp>, const HEADER_SIZE: usize>(
         &self,
-        ctx: &mut ragu::StepCtx<'_>,
-        (value, classes, mask, elapsed_seq, extended_seq, contents): Self::Witness<'source>,
+        ctx: &mut StepCtx<'_, 'dr, D>,
+        witness: DriverValue<D, Self::Witness<'source>>,
+        left: DriverValue<D, <Self::Left as Header>::Data>,
+        right: DriverValue<D, <Self::Right as Header>::Data>,
+    ) -> ragu_core::Result<(
         (
-            unspent_anchor_start,
-            unspent_epoch_start,
-            unspent_elapsed,
-            unspent_epoch_next,
-            unspent_anchor_next,
-        ): <Self::Left as Header>::Data,
-        (
-            bucket_epoch,
-            bucket_anchor_start,
-            bucket_anchor_next,
-            discriminant,
-            profile,
-            contents_commit,
-        ): <Self::Right as Header>::Data,
-    ) -> ragu_core::Result<(<Self::Output as Header>::Data, Self::Aux<'source>)> {
-        enforce_zero(
-            Fp::from(unspent_anchor_next) - Fp::from(bucket_anchor_start),
-            "UnspentLift: the bucket does not start where the segment ends",
+            Encoded<'dr, D, Self::Left, HEADER_SIZE>,
+            Encoded<'dr, D, Self::Right, HEADER_SIZE>,
+            Encoded<'dr, D, Self::Output, HEADER_SIZE>,
+        ),
+        Bound<'dr, D, Self::Shared>,
+        DriverValue<D, <Self::Output as Header>::Data>,
+        DriverValue<D, Self::Aux<'source>>,
+    )>
+    where
+        Self: 'dr,
+    {
+        let left_encoded =
+            Encoded::<D, Self::Left, HEADER_SIZE>::new(ctx.dr, &mut (), left.clone())?;
+        let right_encoded =
+            Encoded::<D, Self::Right, HEADER_SIZE>::new(ctx.dr, &mut (), right.clone())?;
+        let epoch_element = right_encoded.as_gadget().epoch.element.clone();
+        let epoch_next = crate::gadgets::epoch::EpochIndexGadget::from((epoch_element).clone())
+            .next(ctx.dr)
+            .map(|epoch| epoch.element)
+            .map_err(|_err| {
+                ragu_core::Error::InvalidWitness("UnspentLift: bucket has no next epoch".into())
+            })?;
+        let unspent_epoch = left_encoded.as_gadget().epoch_next.element.clone();
+        unspent_epoch
+            .enforce_equal(ctx.dr, &epoch_element)
+            .map_err(|_err| {
+                ragu_core::Error::InvalidWitness(
+                    "UnspentLift: the bucket is not the segment's next epoch".into(),
+                )
+            })?;
+        let unspent_end = left_encoded.as_gadget().anchor_next.element.clone();
+        let bucket_start = right_encoded.as_gadget().anchor_start.element.clone();
+        unspent_end
+            .enforce_equal(ctx.dr, &bucket_start)
+            .map_err(|_err| {
+                ragu_core::Error::InvalidWitness(
+                    "UnspentLift: the bucket does not start where the segment ends".into(),
+                )
+            })?;
+        let value_element = Element::alloc(
+            ctx.dr,
+            &mut (),
+            witness.as_ref().map(|data| Fp::from(data.0)),
         )?;
-        enforce_zero(
-            Fp::from(unspent_epoch_next) - Fp::from(bucket_epoch),
-            "UnspentLift: the bucket is not the segment's next epoch",
+        value_element
+            .clone()
+            .enforce_nonzero(ctx.dr)
+            .map_err(|_err| {
+                ragu_core::Error::InvalidWitness("UnspentLift: tested value is zero".into())
+            })?;
+        let discriminant_element = right_encoded.as_gadget().discriminant.element.clone();
+        crate::gadgets::profile::QrProfileGadget {
+            depth: (&[
+                right_encoded.as_gadget().profile.depth.clone(),
+                right_encoded.as_gadget().profile.bits.clone(),
+            ])[0]
+                .clone(),
+            bits: (&[
+                right_encoded.as_gadget().profile.depth.clone(),
+                right_encoded.as_gadget().profile.bits.clone(),
+            ])[1]
+                .clone(),
+        }
+        .enforce_value(
+            ctx.dr,
+            &value_element,
+            &discriminant_element,
+            witness.as_ref().map(|data| data.1),
+            witness.as_ref().map(|data| data.2),
         )?;
-        enforce_equal_point(
-            Eq::from(contents.commit()),
-            Eq::from(contents_commit),
-            "UnspentLift: contents do not match the bucket",
-        )?;
-        enforce_equal_point(
-            Eq::from(elapsed_seq.commit()),
-            Eq::from(unspent_elapsed),
-            "UnspentLift: elapsed does not match header",
-        )?;
-        enforce_nonzero(Fp::from(value), "UnspentLift: tested value is zero")?;
-        enforce_value_profile(value, discriminant, profile, &classes, &mask)?;
-
-        let epoch_next = bucket_epoch.next().ok_or_else(|| {
-            ragu_core::Error::InvalidWitness("UnspentLift: bucket has no next epoch".into())
-        })?;
-
-        let z =
-            ctx.derive_challenge(
-                &[elapsed_seq.commit().into(), extended_seq.commit().into(), {
-                    // The mock absorbs only points, so absorb `[value]·G_0`.
-                    #[expect(clippy::expect_used, reason = "constant size")]
-                    let &g0 = Pasta::host_generators(pasta::baked())
-                        .g()
-                        .first()
-                        .expect("at least one generator");
-                    g0 * Fp::from(value)
-                }],
-            )?;
-        let elapsed_at_z = elapsed_seq.eval(z);
-        let extended_at_z = extended_seq.eval(z);
-        ctx.enforce_poly_query(elapsed_seq.commit().into(), z, elapsed_at_z)?;
-        ctx.enforce_poly_query(extended_seq.commit().into(), z, extended_at_z)?;
-        enforce_zero(
-            extended_at_z
-                - (elapsed_at_z
-                    * indexed_multiset::direct_eval([(u64::from(bucket_epoch), value.into())], z)),
-            "UnspentLift: extended is not elapsed with the tested pair",
-        )?;
-
-        let contents_at_value = contents.eval(value.into());
-        ctx.enforce_poly_query(contents_commit.into(), value.into(), contents_at_value)?;
-        enforce_nonzero(
-            contents_at_value,
-            "UnspentLift: found nullifier in the bucket",
-        )?;
-
-        Ok((
-            (
+        let native = D::try_just(|| {
+            let (value, _, _, elapsed_seq, extended_seq, contents) = witness.clone().take();
+            let (unspent_anchor_start, unspent_epoch_start, ..) = left.take();
+            let (bucket_epoch, _, bucket_anchor_next, ..) = right.take();
+            let output = (
                 unspent_anchor_start,
                 unspent_epoch_start,
                 extended_seq.commit(),
-                epoch_next,
+                crate::gadgets::epoch::EpochIndexGadget::from((epoch_next).clone())
+                    .value()
+                    .take(),
                 bucket_anchor_next,
-            ),
+            );
+            Ok((
+                elapsed_seq,
+                extended_seq,
+                contents,
+                value,
+                bucket_epoch,
+                output,
+            ))
+        })?;
+
+        let elapsed_handle =
+            ctx.witness_polynomial(native.clone().map(|witnessed| witnessed.0.as_ref().clone()))?;
+        let extended_handle =
+            ctx.witness_polynomial(native.clone().map(|witnessed| witnessed.1.as_ref().clone()))?;
+        let contents_handle =
+            ctx.witness_polynomial(native.clone().map(|witnessed| witnessed.2.as_ref().clone()))?;
+        bind_poly_handle(
+            ctx,
+            &elapsed_handle,
+            &left_encoded.as_gadget().elapsed.encoding.limbs,
+            "UnspentLift: elapsed does not match header",
+        )?;
+        bind_poly_handle(
+            ctx,
+            &contents_handle,
+            &right_encoded.as_gadget().contents.encoding.limbs,
+            "UnspentLift: contents do not match the bucket",
+        )?;
+
+        let [elapsed_lo, elapsed_hi] = poly_handle_limbs(ctx.dr, &elapsed_handle)?;
+        let [extended_lo, extended_hi] = poly_handle_limbs(ctx.dr, &extended_handle)?;
+        let z = ctx.derive_challenge(&(
+            [elapsed_lo, elapsed_hi],
+            ([extended_lo, extended_hi], value_element.clone()),
+        ))?;
+
+        let elapsed_assignment =
+            ctx.evaluate(&elapsed_handle, z.value().map(|challenge| *challenge))?;
+        let extended_assignment =
+            ctx.evaluate(&extended_handle, z.value().map(|challenge| *challenge))?;
+        let elapsed_at_z = Element::alloc(ctx.dr, &mut (), elapsed_assignment)?;
+        let extended_at_z = Element::alloc(ctx.dr, &mut (), extended_assignment)?;
+        let index_element = epoch_next.clone();
+        let factor = indexed_member_factor(ctx.dr, &value_element, &index_element, &z)?;
+        let expected_extended = elapsed_at_z.mul(ctx.dr, &factor)?;
+        extended_at_z
+            .enforce_equal(ctx.dr, &expected_extended)
+            .map_err(|_err| {
+                ragu_core::Error::InvalidWitness(
+                    "UnspentLift: extended is not elapsed with the tested pair".into(),
+                )
+            })?;
+        ctx.enforce_poly_query(
+            &elapsed_handle,
+            Element::promote(z.wire().clone(), z.value().map(|challenge| *challenge)),
+            elapsed_at_z,
+        )?;
+        ctx.enforce_poly_query(
+            &extended_handle,
+            Element::promote(z.wire().clone(), z.value().map(|challenge| *challenge)),
+            extended_at_z,
+        )?;
+
+        let contents_assignment =
+            ctx.evaluate(&contents_handle, value_element.value().map(|value| *value))?;
+        let contents_at_value = Element::alloc(ctx.dr, &mut (), contents_assignment)?;
+        let nonzero_value = Element::promote(
+            contents_at_value.wire().clone(),
+            contents_at_value.value().map(|value| *value),
+        );
+        nonzero_value.enforce_nonzero(ctx.dr).map_err(|_err| {
+            ragu_core::Error::InvalidWitness("UnspentLift: found nullifier in the bucket".into())
+        })?;
+        ctx.enforce_poly_query(&contents_handle, value_element, contents_at_value)?;
+
+        let output = native.map(|witnessed| witnessed.5);
+        let fields = crate::stamp::headers::pool::ArbitraryUnspentOutput {
+            anchor_start: (left_encoded.as_gadget().anchor_start.element.clone()).into(),
+            epoch_start: (left_encoded.as_gadget().epoch_start.element.clone()).into(),
+            epoch_next: (epoch_next).into(),
+            anchor_next: (right_encoded.as_gadget().anchor_next.element.clone()).into(),
+            elapsed: (crate::gadgets::commitment::HostCommitment {
+                limbs: poly_handle_limbs(ctx.dr, &extended_handle)?,
+            })
+            .into(),
+        };
+        Ok((
+            (left_encoded, right_encoded, Encoded::from_gadget(fields)),
             (),
+            output,
+            D::unit(),
         ))
     }
 }
@@ -492,70 +635,120 @@ impl Step for UnspentLift {
 #[derive(Debug)]
 pub struct UnspentBind;
 
+#[expect(
+    clippy::pattern_type_mismatch,
+    reason = "Maybe projections borrow fixed witness tuples without moving polynomial wrappers"
+)]
 impl Step for UnspentBind {
     type Aux<'source> = ();
     type Left = ArbitraryUnspent;
     type Output = NoteUnspent;
     type Right = NoteNullifiers;
+    type Shared = ();
     /// `(elapsed_seq, nf_seq, complement_seq)`
     type Witness<'source> = (NfSeqPoly, NfSeqPoly, NfSeqPoly);
 
     const INDEX: Index = Index::new(3);
 
-    fn witness<'source>(
+    fn witness<'dr, 'source: 'dr, D: Driver<'dr, F = Fp>, const HEADER_SIZE: usize>(
         &self,
-        ctx: &mut ragu::StepCtx<'_>,
-        (elapsed_seq, nf_seq, complement_seq): Self::Witness<'source>,
+        ctx: &mut StepCtx<'_, 'dr, D>,
+        witness: DriverValue<D, Self::Witness<'source>>,
+        left: DriverValue<D, <Self::Left as Header>::Data>,
+        right: DriverValue<D, <Self::Right as Header>::Data>,
+    ) -> ragu_core::Result<(
         (
-            unspent_anchor_start,
-            unspent_epoch_start,
-            unspent_elapsed,
-            unspent_epoch_next,
-            unspent_anchor_next,
-        ): <Self::Left as Header>::Data,
-        (nullifiers_cm, _, nf_commit, _): <Self::Right as Header>::Data,
-    ) -> ragu_core::Result<(<Self::Output as Header>::Data, Self::Aux<'source>)> {
-        // Defensive. `QrUnspentInit` emits `epoch_next = epoch_start + 1`, and
-        // every other producer only raises `epoch_next`, so every
-        // `ArbitraryUnspent` covers at least one epoch.
-        // TODO: a real circuit needs a range decomposition of
-        // `epoch_next - epoch_start`; mock ragu accepts the native comparison.
-        if unspent_epoch_next <= unspent_epoch_start {
-            return Err(ragu_core::Error::InvalidWitness(
-                "UnspentBind: segment covers no epoch".into(),
-            ));
-        }
-
-        enforce_equal_point(
-            elapsed_seq.commit().into(),
-            Eq::from(unspent_elapsed),
+            Encoded<'dr, D, Self::Left, HEADER_SIZE>,
+            Encoded<'dr, D, Self::Right, HEADER_SIZE>,
+            Encoded<'dr, D, Self::Output, HEADER_SIZE>,
+        ),
+        Bound<'dr, D, Self::Shared>,
+        DriverValue<D, <Self::Output as Header>::Data>,
+        DriverValue<D, Self::Aux<'source>>,
+    )>
+    where
+        Self: 'dr,
+    {
+        let left_encoded =
+            Encoded::<D, Self::Left, HEADER_SIZE>::new(ctx.dr, &mut (), left.clone())?;
+        let right_encoded =
+            Encoded::<D, Self::Right, HEADER_SIZE>::new(ctx.dr, &mut (), right.clone())?;
+        let elapsed_handle = ctx.witness_polynomial(
+            witness
+                .as_ref()
+                .map(|(elapsed_seq, ..)| elapsed_seq.as_ref().clone()),
+        )?;
+        let nf_handle = ctx.witness_polynomial(
+            witness
+                .as_ref()
+                .map(|(_, nf_seq, _)| nf_seq.as_ref().clone()),
+        )?;
+        let complement_handle = ctx.witness_polynomial(
+            witness
+                .as_ref()
+                .map(|(_, _, complement_seq)| complement_seq.as_ref().clone()),
+        )?;
+        bind_poly_handle(
+            ctx,
+            &elapsed_handle,
+            &left_encoded.as_gadget().elapsed.encoding.limbs,
             "UnspentBind: elapsed polynomial does not match header",
         )?;
-        enforce_equal_point(
-            Eq::from(nf_seq.commit()),
-            Eq::from(nf_commit),
+        bind_poly_handle(
+            ctx,
+            &nf_handle,
+            &right_encoded.as_gadget().nf_commit.encoding.limbs,
             "UnspentBind: covering sequence does not match header",
         )?;
-
-        // The divisibility bind: `nf_seq = elapsed · complement`, so every
-        // elapsed member is a genuine derived pair.
         enforce_poly_product(
             ctx,
-            elapsed_seq.as_ref(),
-            complement_seq.as_ref(),
-            nf_seq.as_ref(),
+            &elapsed_handle,
+            &complement_handle,
+            &nf_handle,
             "UnspentBind: sequence does not match the derivation",
         )?;
-
-        Ok((
-            (
-                nullifiers_cm,
+        let start = left_encoded.as_gadget().epoch_start.element.clone();
+        let end = left_encoded.as_gadget().epoch_next.element.clone();
+        let one = Element::constant(ctx.dr, Fp::ONE);
+        let span_minus_one = end.sub(ctx.dr, &start).sub(ctx.dr, &one);
+        circuit::bits::<D, 32>(ctx.dr, &span_minus_one).map_err(|_err| {
+            ragu_core::Error::InvalidWitness("UnspentBind: segment covers no epoch".into())
+        })?;
+        let output = D::try_just(|| {
+            let (
                 unspent_anchor_start,
                 unspent_epoch_start,
+                _,
                 unspent_epoch_next,
                 unspent_anchor_next,
-            ),
+            ) = left.take();
+            let (nullifiers_cm, ..) = right.take();
+            Ok((
+                (
+                    nullifiers_cm,
+                    unspent_anchor_start,
+                    unspent_epoch_start,
+                    unspent_epoch_next,
+                    unspent_anchor_next,
+                ),
+                (),
+            ))
+        })?;
+        let (data, aux) = output.cast();
+        let fields = crate::stamp::headers::pool::NoteUnspentOutput {
+            cm: (right_encoded.as_gadget().cm.element.clone()).into(),
+            anchor_start: (left_encoded.as_gadget().anchor_start.element.clone()).into(),
+            epoch_start: (left_encoded.as_gadget().epoch_start.element.clone()).into(),
+            epoch_next: (left_encoded.as_gadget().epoch_next.element.clone()).into(),
+            anchor_next: (left_encoded.as_gadget().anchor_next.element.clone()).into(),
+        };
+        Ok((
+            (left_encoded, right_encoded, Encoded::from_gadget(fields)),
             (),
+            data,
+            aux,
         ))
     }
 }
+
+pub use crate::stamp::headers::pool::{AnchorSpan, ArbitraryUnspent, NoteUnspent};

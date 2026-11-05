@@ -8,7 +8,7 @@ use zcash_tachyon::{
     TachygramSetCommit,
     constants::EVIDENCE_TREE_ARITY,
     pasta::Fp,
-    stamp::proof::{PROOF_SYSTEM, evidence, qr},
+    stamp::proof::{HEADER_SIZE, PROOF_SYSTEM, evidence, qr},
     witness,
 };
 
@@ -88,7 +88,7 @@ fn descend_to_leaf(
                 evidence::EvidenceTreeDescend,
                 witness::evidence_tree_descend((*node.data(), ()), path),
                 node,
-                Proof::bootstrap().carry::<()>(()),
+                Proof::bootstrap::<HEADER_SIZE>().carry::<()>(()),
             )
             .expect("EvidenceTreeDescend");
         node = pcd;
@@ -112,7 +112,7 @@ fn open_leaf(
             evidence::EvidenceTreeOpen,
             witness::evidence_tree_open((*node.data(), ()), profile, contents),
             node,
-            Proof::bootstrap().carry::<()>(()),
+            Proof::bootstrap::<HEADER_SIZE>().carry::<()>(()),
         )
         .map(|(bucket, ())| bucket)
 }
@@ -491,7 +491,7 @@ fn evidence_tree_cap_is_transparent_to_a_descent() {
             evidence::EvidenceTreeCap,
             (),
             tree.pcd,
-            Proof::bootstrap().carry::<()>(()),
+            Proof::bootstrap::<HEADER_SIZE>().carry::<()>(()),
         )
         .expect("EvidenceTreeCap");
     let raised = *capped.data();
@@ -598,7 +598,7 @@ fn evidence_tree_descend_rejects_children_that_miss_the_node() {
             evidence::EvidenceTreeDescend,
             witness::evidence_tree_descend((*tree.pcd.data(), ()), path),
             tree.pcd,
-            Proof::bootstrap().carry::<()>(()),
+            Proof::bootstrap::<HEADER_SIZE>().carry::<()>(()),
         )
         .err()
         .unwrap();
@@ -638,7 +638,7 @@ fn evidence_tree_open_rejects_a_node_presented_as_a_leaf() {
             evidence::EvidenceTreeOpen,
             witness::evidence_tree_open((*tree.pcd.data(), ()), leaf.profile, leaf.contents),
             tree.pcd,
-            Proof::bootstrap().carry::<()>(()),
+            Proof::bootstrap::<HEADER_SIZE>().carry::<()>(()),
         )
         .err()
         .unwrap();

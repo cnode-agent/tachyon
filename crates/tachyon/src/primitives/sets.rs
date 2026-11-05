@@ -2,8 +2,8 @@ use core::iter;
 
 use corez::io::{self, Read, Write};
 use derive_more::{AsRef, Debug, Eq as TotalEq, From, Into, PartialEq};
+use ragu::{Cycle as _, FixedGenerators as _, pasta::Pasta};
 use ragu_circuits::polynomials::{ProductionRank, sparse::Polynomial};
-use ragu_core::{Cycle as _, FixedGenerators as _, pasta::Pasta};
 use udon::curve::Projective as _;
 
 use super::{ActionDigest, Anchor, Tachygram};
@@ -115,7 +115,7 @@ pub struct ActionSetPoly(Polynomial<Fp, ProductionRank>);
 
 /// Witness polynomial for an anchor span's member set (members encoded as
 /// roots).
-#[derive(AsRef, Clone, Debug, Into)]
+#[derive(AsRef, Clone, Debug, From, Into)]
 pub struct AnchorSetPoly(Polynomial<Fp, ProductionRank>);
 
 impl AnchorSetPoly {

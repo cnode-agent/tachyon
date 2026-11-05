@@ -2,45 +2,32 @@
 
 extern crate alloc;
 
-use alloc::{vec, vec::Vec};
-
-use ragu::{Header, Index, Step, Suffix};
+use ragu::{
+    Cycle as _, Encoded, Header, Index, PoseidonPermutation as _, Step, StepCtx,
+    pasta::{Pasta, PoseidonFp},
+};
+use ragu_core::{
+    drivers::{Driver, DriverValue},
+    gadgets::Bound,
+    maybe::Maybe as _,
+};
+use ragu_primitives::{
+    Element,
+    poseidon::{Sponge, SpongeState},
+    vec::FixedVec,
+};
+use udon::{curve::Projective as _, field::Field as _};
 
 use crate::{
     Tachygram,
     constants::MAX_MONEY,
     digest::poseidon,
+    gadgets::arithmetic as circuit,
     note::Note,
-    pasta::{Ep, Eq, Fp, Fq},
-    ragu_constraint::enforce_nonzero,
+    pasta,
+    pasta::{Fp, Fq},
     value,
 };
-
-/// Header binding an output's tachygram pair and value to one note
-/// (wallet-only).
-///
-/// Carries the note commitment `cm`, the padding tachygram `pad`, and the
-/// value commitment `cv`, all derived from the same note. `rk` is produced
-/// downstream at [`OutputAction`](super::stamp::OutputAction).
-#[derive(Debug)]
-pub struct OutputHeader;
-
-impl Header for OutputHeader {
-    /// `(cm, pad, cv)`
-    type Data = (Tachygram, Tachygram, value::Commitment);
-
-    const SUFFIX: Suffix = Suffix::new(7);
-
-    fn encode(data: &Self::Data) -> (Vec<Fp>, Vec<Fq>, Vec<Ep>, Vec<Eq>) {
-        let (cm, pad, cv) = *data;
-        (
-            vec![Fp::from(cm), Fp::from(pad)],
-            Vec::new(),
-            vec![Ep::from(cv)],
-            Vec::new(),
-        )
-    }
-}
 
 /// Derives an output's tachygram pair from one note, and commits its negated
 /// value as
@@ -55,42 +42,109 @@ impl Step for OutputBind {
     type Left = ();
     type Output = OutputHeader;
     type Right = ();
+    type Shared = ();
     /// `(note, rcv)`.
     type Witness<'source> = (Note, value::Trapdoor);
 
     const INDEX: Index = Index::new(6);
 
-    fn witness<'source>(
+    fn witness<'dr, 'source: 'dr, D: Driver<'dr, F = Fp>, const HEADER_SIZE: usize>(
         &self,
-        _ctx: &mut ragu::StepCtx<'_>,
-        (note, rcv): Self::Witness<'source>,
-        _left: <Self::Left as Header>::Data,
-        _right: <Self::Right as Header>::Data,
-    ) -> ragu_core::Result<(<Self::Output as Header>::Data, Self::Aux<'source>)> {
-        if u64::from(note.value) > MAX_MONEY {
-            return Err(ragu_core::Error::InvalidWitness(
-                "OutputBind: note value exceeds maximum".into(),
-            ));
-        }
-
-        let (cm, pad) = {
-            let (rcm, pk, value, psi) = (
-                Fp::from(note.rcm),
-                Fp::from(note.pk),
-                u64::from(note.value),
-                Fp::from(note.psi),
-            );
-            (
-                Tachygram::from(poseidon::note_commitment(rcm, pk, value, psi)),
-                Tachygram::from(poseidon::pad_tachygram(rcm, pk, value, psi)),
+        ctx: &mut StepCtx<'_, 'dr, D>,
+        witness: DriverValue<D, Self::Witness<'source>>,
+        left: DriverValue<D, <Self::Left as Header>::Data>,
+        right: DriverValue<D, <Self::Right as Header>::Data>,
+    ) -> ragu_core::Result<(
+        (
+            Encoded<'dr, D, Self::Left, HEADER_SIZE>,
+            Encoded<'dr, D, Self::Right, HEADER_SIZE>,
+            Encoded<'dr, D, Self::Output, HEADER_SIZE>,
+        ),
+        Bound<'dr, D, Self::Shared>,
+        DriverValue<D, <Self::Output as Header>::Data>,
+        DriverValue<D, Self::Aux<'source>>,
+    )>
+    where
+        Self: 'dr,
+    {
+        let left_encoded = Encoded::<D, Self::Left, HEADER_SIZE>::new(ctx.dr, &mut (), left)?;
+        let right_encoded = Encoded::<D, Self::Right, HEADER_SIZE>::new(ctx.dr, &mut (), right)?;
+        let amount = Element::alloc(
+            ctx.dr,
+            &mut (),
+            witness
+                .as_ref()
+                .map(|data| Fp::from(u64::from(data.0.value))),
+        )?;
+        circuit::bounded::<D, 51>(ctx.dr, &amount, MAX_MONEY)?;
+        let rcm = Element::alloc(
+            ctx.dr,
+            &mut (),
+            witness.as_ref().map(|data| Fp::from(data.0.rcm)),
+        )?;
+        let pk = Element::alloc(
+            ctx.dr,
+            &mut (),
+            witness.as_ref().map(|data| Fp::from(data.0.pk)),
+        )?;
+        let psi = Element::alloc(
+            ctx.dr,
+            &mut (),
+            witness.as_ref().map(|data| Fp::from(data.0.psi)),
+        )?;
+        let input = [rcm, pk, amount.clone(), psi];
+        let cm = poseidon::note_commitment_circuit(ctx.dr, &input)?;
+        let state = SpongeState::from_elements(FixedVec::from_fn(|index| {
+            Element::constant(
+                ctx.dr,
+                if index == PoseidonFp::RATE {
+                    Fp::from_u128(u128::from_le_bytes(*b"Tachyon-CmOutPad"))
+                } else {
+                    Fp::ZERO
+                },
             )
+        }));
+        let mut sponge = Sponge::resume(state, Pasta::circuit_poseidon(pasta::baked()));
+        for element in &input {
+            sponge.absorb(ctx.dr, element)?;
+        }
+        let pad = sponge.squeeze(ctx.dr)?;
+        cm.clone().enforce_nonzero(ctx.dr)?;
+        pad.clone().enforce_nonzero(ctx.dr)?;
+        let amount_bits = circuit::bits::<D, 51>(ctx.dr, &amount)?;
+        let rcv_bits =
+            circuit::scalar_bits(ctx.dr, &witness.as_ref().map(|data| Fq::from(data.1)))?;
+        let value_generator = crate::gadgets::point::CurvePoint::constant(
+            ctx.dr,
+            (-*value::VALUE_COMMIT_V).to_affine(),
+        )?;
+        let blind_generator =
+            crate::gadgets::point::CurvePoint::constant(ctx.dr, value::VALUE_COMMIT_R.to_affine())?;
+        let value_point =
+            crate::gadgets::point::CurvePoint::scale(ctx.dr, &value_generator, &amount_bits)?;
+        let blind_point =
+            crate::gadgets::point::CurvePoint::scale(ctx.dr, &blind_generator, &rcv_bits)?;
+        let cv = crate::gadgets::point::CurvePoint::add(ctx.dr, &value_point, &blind_point)?;
+        cv.enforce_nonidentity(ctx.dr)?;
+        let output = D::just(|| {
+            (
+                Tachygram::from(*cm.value().take()),
+                Tachygram::from(*pad.value().take()),
+                value::Commitment::from(cv.value().take()),
+            )
+        });
+        let fields = crate::stamp::headers::output::OutputHeaderOutput {
+            cm: (cm).into(),
+            pad: (pad).into(),
+            cv: (cv).into(),
         };
-
-        // Two zero tachygrams collide whatever they were meant to be, and a
-        // zero root leaves the accumulator factor `(X - tg)` trivial.
-        enforce_nonzero(Fp::from(cm), "OutputBind: note commitment is zero")?;
-        enforce_nonzero(Fp::from(pad), "OutputBind: padding tachygram is zero")?;
-
-        Ok(((cm, pad, rcv.commit(-note.value)), ()))
+        Ok((
+            (left_encoded, right_encoded, Encoded::from_gadget(fields)),
+            (),
+            output,
+            D::unit(),
+        ))
     }
 }
+
+pub use crate::stamp::headers::output::OutputHeader;
