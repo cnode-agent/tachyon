@@ -80,16 +80,24 @@ pub struct Note {
 }
 
 impl Note {
-    /// Derive a max fee blind $r$ from note fields.
+    /// The feemax blind, the trapdoor $r$ of `cv_feemax`, derived from note
+    /// fields.
     #[must_use]
     #[expect(
         clippy::expect_used,
         clippy::missing_panics_doc,
         reason = "p < q, so every Fp repr is canonical in Fq"
     )]
-    pub fn fee_blind(&self) -> value::Trapdoor {
-        let blind = poseidon::fee_blind(Fp::from(self.pk), Fp::from(self.psi), Fp::from(self.rcm));
+    pub fn derive_feemax_blind(&self) -> value::Trapdoor {
+        let blind =
+            poseidon::feemax_blind(Fp::from(self.pk), Fp::from(self.psi), Fp::from(self.rcm));
         value::Trapdoor::from_scalar(Fq::from_bytes(blind.to_bytes()).expect("p < q"))
+    }
+
+    /// The max fee commitment, `cv_feemax`.
+    #[must_use]
+    pub fn cv_feemax(&self) -> value::Commitment {
+        self.derive_feemax_blind().commit(-self.value)
     }
 
     /// Computes the note commitment `cm`.
@@ -126,55 +134,4 @@ impl Note {
 pub struct Commitment(Tachygram);
 
 #[cfg(test)]
-mod tests {
-    use rand::{SeedableRng as _, rngs::StdRng};
-
-    use super::*;
-    use crate::{constants::MAX_MONEY, value};
-
-    #[test]
-    fn positive_value_accepts_max() {
-        value::Positive::try_from(MAX_MONEY).unwrap();
-    }
-
-    #[test]
-    fn positive_value_rejects_over_max() {
-        assert_eq!(
-            value::Positive::try_from(MAX_MONEY + 1),
-            Err(value::OutOfRange)
-        );
-    }
-
-    #[test]
-    fn positive_value_accepts_zero() {
-        value::Positive::try_from(0u64).unwrap();
-    }
-
-    #[test]
-    fn positive_value_rejects_negative() {
-        assert_eq!(value::Positive::try_from(-1i64), Err(value::OutOfRange));
-    }
-
-    /// Different trapdoors produce different commitments.
-    #[test]
-    fn distinct_rcm_distinct_commitments() {
-        let rng = &mut StdRng::seed_from_u64(0);
-        let pk = PaymentKey::random(rng);
-        let psi = nullifier::Trapdoor::random(rng);
-
-        let note1 = Note {
-            pk,
-            value: value::Positive::try_from(100u64).unwrap(),
-            psi,
-            rcm: CommitmentTrapdoor::random(rng),
-        };
-        let note2 = Note {
-            pk,
-            value: value::Positive::try_from(100u64).unwrap(),
-            psi,
-            rcm: CommitmentTrapdoor::random(rng),
-        };
-
-        assert_ne!(note1.commitment(), note2.commitment());
-    }
-}
+mod tests;

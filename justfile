@@ -12,17 +12,20 @@ fmt:
 
 lint: doc
     cargo clippy --workspace --lib --no-default-features # no_std
-    cargo clippy --workspace --all-targets --all-features
+    cargo clippy --workspace --all-targets --features test-epoch-size
 
+# unit tests, then integration tests and doctests with --release; ARGS go to libtest
 test *ARGS:
-    cargo test --workspace --all-features {{ARGS}}
+    cargo test --workspace --features test-epoch-size --lib -- {{ARGS}}
+    cargo test --workspace --release --features test-epoch-size --test integration -- {{ARGS}}
+    cargo test --workspace --release --features test-epoch-size --doc -- {{ARGS}}
 
 doc *ARGS:
     RUSTDOCFLAGS="{{_katex}}" cargo doc --workspace --no-deps --document-private-items {{ARGS}}
 
 check:
     cargo check --workspace --lib --no-default-features # no_std
-    cargo check --workspace --all-targets --all-features
+    cargo check --workspace --all-targets --features test-epoch-size
 
 _install_binstall:
     cargo-binstall -V || cargo install cargo-binstall
@@ -38,7 +41,9 @@ book COMMAND *ARGS: _book_setup
 ci_local:
     cargo +{{_nightly}} fmt --all -- --check
     cargo clippy --workspace --lib --no-default-features --locked -- -D warnings
-    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-    cargo test --release --all --locked --lib
-    cargo test --release --all --locked --all-features
+    cargo clippy --workspace --all-targets --features test-epoch-size --locked -- -D warnings
+    cargo test --workspace --locked --features test-epoch-size --lib
+    cargo test --workspace --locked --test epoch
+    cargo test --workspace --locked --release --features test-epoch-size --test integration
     RUSTDOCFLAGS="-D warnings {{_katex}}" cargo doc --no-deps --all --locked --document-private-items
+    cargo test --workspace --locked --doc

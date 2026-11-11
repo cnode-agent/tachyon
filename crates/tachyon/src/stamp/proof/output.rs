@@ -3,31 +3,71 @@
 extern crate alloc;
 
 use ragu::{
-    Cycle as _, Encoded, Header, Index, PoseidonPermutation as _, Step, StepCtx,
-    pasta::{Pasta, PoseidonFp},
+    header::{Header, Suffix},
+    step::{Encoded, Index, Oracles, Step},
 };
 use ragu_core::{
     drivers::{Driver, DriverValue},
-    gadgets::Bound,
+    gadgets::{Bound, Gadget, Kind},
     maybe::Maybe as _,
+    pasta::Pasta,
 };
-use ragu_primitives::{
-    Element,
-    poseidon::{Sponge, SpongeState},
-    vec::FixedVec,
-};
-use udon::{curve::Projective as _, field::Field as _};
+use ragu_primitives::{Element, Point, allocator::Allocator, io::Write};
+use udon::curve::EndomorphismAffine;
 
 use crate::{
     Tachygram,
     constants::MAX_MONEY,
     digest::poseidon,
-    gadgets::arithmetic as circuit,
+    gadgets::{arithmetic as circuit, curve},
     note::Note,
-    pasta,
-    pasta::{Fp, Fq},
+    pasta::{EpAffine, Fp, Fq},
     value,
 };
+
+/// Header binding an output's tachygram pair and value to one note
+/// (wallet-only).
+///
+/// Carries the note commitment `cm`, the padding tachygram `pad`, and the
+/// value commitment `cv`, all derived from the same note. `rk` is produced
+/// downstream at [`OutputAction`](super::stamp::OutputAction).
+#[derive(Debug)]
+pub struct OutputHeader;
+
+#[derive(Gadget, Write)]
+pub struct OutputHeaderOutput<'dr, D: Driver<'dr>, C: EndomorphismAffine<Base = D::F>> {
+    pub cm: Element<'dr, D>,
+    pub pad: Element<'dr, D>,
+    pub cv: Point<'dr, D, C>,
+}
+
+impl Header<Fp> for OutputHeader {
+    /// `(cm, pad, cv)`
+    type Data = (Tachygram, Tachygram, value::Commitment);
+    type Output = Kind![Fp; OutputHeaderOutput<'_, _, EpAffine>];
+
+    const SUFFIX: Suffix = Suffix::new(7);
+
+    fn encode<'dr, D: Driver<'dr, F = Fp>, A: Allocator<'dr, D>>(
+        dr: &mut D,
+        allocator: &mut A,
+        witness: DriverValue<D, Self::Data>,
+    ) -> ragu_core::Result<Bound<'dr, D, Self::Output>> {
+        Ok(OutputHeaderOutput {
+            cm: Element::alloc(
+                dr,
+                allocator,
+                witness.as_ref().map(|fields| Fp::from(fields.0)),
+            )?,
+            pad: Element::alloc(
+                dr,
+                allocator,
+                witness.as_ref().map(|fields| Fp::from(fields.1)),
+            )?,
+            cv: Point::alloc(dr, witness.as_ref().map(|fields| EpAffine::from(fields.2)))?,
+        })
+    }
+}
 
 /// Derives an output's tachygram pair from one note, and commits its negated
 /// value as
@@ -37,12 +77,11 @@ use crate::{
 #[derive(Debug)]
 pub struct OutputBind;
 
-impl Step for OutputBind {
+impl Step<Pasta> for OutputBind {
     type Aux<'source> = ();
     type Left = ();
     type Output = OutputHeader;
     type Right = ();
-    type Shared = ();
     /// `(note, rcv)`.
     type Witness<'source> = (Note, value::Trapdoor);
 
@@ -50,82 +89,58 @@ impl Step for OutputBind {
 
     fn witness<'dr, 'source: 'dr, D: Driver<'dr, F = Fp>, const HEADER_SIZE: usize>(
         &self,
-        ctx: &mut StepCtx<'_, 'dr, D>,
+        dr: &mut D,
+        _oracles: &mut Oracles<'_, 'dr, D>,
         witness: DriverValue<D, Self::Witness<'source>>,
-        left: DriverValue<D, <Self::Left as Header>::Data>,
-        right: DriverValue<D, <Self::Right as Header>::Data>,
+        left: DriverValue<D, <Self::Left as Header<Fp>>::Data>,
+        right: DriverValue<D, <Self::Right as Header<Fp>>::Data>,
     ) -> ragu_core::Result<(
         (
             Encoded<'dr, D, Self::Left, HEADER_SIZE>,
             Encoded<'dr, D, Self::Right, HEADER_SIZE>,
             Encoded<'dr, D, Self::Output, HEADER_SIZE>,
         ),
-        Bound<'dr, D, Self::Shared>,
-        DriverValue<D, <Self::Output as Header>::Data>,
+        DriverValue<D, <Self::Output as Header<Fp>>::Data>,
         DriverValue<D, Self::Aux<'source>>,
     )>
     where
         Self: 'dr,
     {
-        let left_encoded = Encoded::<D, Self::Left, HEADER_SIZE>::new(ctx.dr, &mut (), left)?;
-        let right_encoded = Encoded::<D, Self::Right, HEADER_SIZE>::new(ctx.dr, &mut (), right)?;
+        let left_encoded = Encoded::<D, Self::Left, HEADER_SIZE>::new(dr, &mut (), left)?;
+        let right_encoded = Encoded::<D, Self::Right, HEADER_SIZE>::new(dr, &mut (), right)?;
         let amount = Element::alloc(
-            ctx.dr,
+            dr,
             &mut (),
             witness
                 .as_ref()
                 .map(|data| Fp::from(u64::from(data.0.value))),
         )?;
-        circuit::bounded::<D, 51>(ctx.dr, &amount, MAX_MONEY)?;
+        let amount_bits = circuit::Bits::<D, 51>::bounded(dr, &amount, MAX_MONEY)?;
         let rcm = Element::alloc(
-            ctx.dr,
+            dr,
             &mut (),
             witness.as_ref().map(|data| Fp::from(data.0.rcm)),
         )?;
         let pk = Element::alloc(
-            ctx.dr,
+            dr,
             &mut (),
             witness.as_ref().map(|data| Fp::from(data.0.pk)),
         )?;
         let psi = Element::alloc(
-            ctx.dr,
+            dr,
             &mut (),
             witness.as_ref().map(|data| Fp::from(data.0.psi)),
         )?;
-        let input = [rcm, pk, amount.clone(), psi];
-        let cm = poseidon::note_commitment_circuit(ctx.dr, &input)?;
-        let state = SpongeState::from_elements(FixedVec::from_fn(|index| {
-            Element::constant(
-                ctx.dr,
-                if index == PoseidonFp::RATE {
-                    Fp::from_u128(u128::from_le_bytes(*b"Tachyon-CmOutPad"))
-                } else {
-                    Fp::ZERO
-                },
-            )
-        }));
-        let mut sponge = Sponge::resume(state, Pasta::circuit_poseidon(pasta::baked()));
-        for element in &input {
-            sponge.absorb(ctx.dr, element)?;
-        }
-        let pad = sponge.squeeze(ctx.dr)?;
-        cm.clone().enforce_nonzero(ctx.dr)?;
-        pad.clone().enforce_nonzero(ctx.dr)?;
-        let amount_bits = circuit::bits::<D, 51>(ctx.dr, &amount)?;
+        let cm =
+            poseidon::with_sponge::note_commitment(dr, &rcm, &pk, &amount, &psi)?.squeeze(dr)?;
+        let pad =
+            poseidon::with_sponge::pad_tachygram(dr, &rcm, &pk, &amount, &psi)?.squeeze(dr)?;
+        cm.clone().enforce_nonzero(dr)?;
+        pad.clone().enforce_nonzero(dr)?;
         let rcv_bits =
-            circuit::scalar_bits(ctx.dr, &witness.as_ref().map(|data| Fq::from(data.1)))?;
-        let value_generator = crate::gadgets::point::CurvePoint::constant(
-            ctx.dr,
-            (-*value::VALUE_COMMIT_V).to_affine(),
-        )?;
-        let blind_generator =
-            crate::gadgets::point::CurvePoint::constant(ctx.dr, value::VALUE_COMMIT_R.to_affine())?;
-        let value_point =
-            crate::gadgets::point::CurvePoint::scale(ctx.dr, &value_generator, &amount_bits)?;
-        let blind_point =
-            crate::gadgets::point::CurvePoint::scale(ctx.dr, &blind_generator, &rcv_bits)?;
-        let cv = crate::gadgets::point::CurvePoint::add(ctx.dr, &value_point, &blind_point)?;
-        cv.enforce_nonidentity(ctx.dr)?;
+            circuit::Bits::<D, 255>::free(dr, &witness.as_ref().map(|data| Fq::from(data.1)))?;
+        let cv =
+            curve::fixed_base::unsigned::NEG_V_TABLE.commitment(dr, &amount_bits, &rcv_bits)?;
         let output = D::just(|| {
             (
                 Tachygram::from(*cm.value().take()),
@@ -133,18 +148,11 @@ impl Step for OutputBind {
                 value::Commitment::from(cv.value().take()),
             )
         });
-        let fields = crate::stamp::headers::output::OutputHeaderOutput {
-            cm: (cm).into(),
-            pad: (pad).into(),
-            cv: (cv).into(),
-        };
+        let fields = OutputHeaderOutput { cm, pad, cv };
         Ok((
             (left_encoded, right_encoded, Encoded::from_gadget(fields)),
-            (),
             output,
             D::unit(),
         ))
     }
 }
-
-pub use crate::stamp::headers::output::OutputHeader;

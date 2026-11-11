@@ -1,8 +1,9 @@
-//! Generic fixed-width circuit arithmetic.
+//! Range checks and integer operations for proof steps.
 
+use derive_more::Deref;
 use ragu_core::{
     Result,
-    drivers::{Driver, DriverValue},
+    drivers::{Coeff, Driver, DriverValue},
     maybe::Maybe as _,
 };
 use ragu_primitives::{
@@ -11,204 +12,149 @@ use ragu_primitives::{
 };
 use udon::field::Field as _;
 
-use crate::pasta::{Fp, Fq};
-/// Unique little-endian decomposition. The canonical comparison matters at
-/// 255 bits, where a modular recomposition alone would allow aliases.
-#[expect(clippy::indexing_slicing, reason = "fixed field and bit widths")]
-pub(crate) fn bits<'dr, D: Driver<'dr, F = Fp>, const N: usize>(
-    dr: &mut D,
-    value: &Element<'dr, D>,
-) -> Result<FixedVec<Boolean<'dr, D>, ConstLen<N>>> {
-    const {
-        assert!(N > 0 && N <= 255, "decomposition width must fit the field");
+use crate::{
+    constants::EPOCH_MAX,
+    pasta::{Fp, Fq},
+    primitives,
+};
+
+/// A fixed-width Boolean decomposition.
+#[derive(Deref)]
+pub(crate) struct Bits<'dr, D: Driver<'dr>, const N: usize>(FixedVec<Boolean<'dr, D>, ConstLen<N>>);
+
+impl<'dr, D: Driver<'dr, F = Fp>, const N: usize> Bits<'dr, D, N> {
+    /// At 255 bits, the representation must also be below the field modulus;
+    /// otherwise distinct bit strings could represent the same field element.
+    #[expect(clippy::indexing_slicing, reason = "fixed field and bit widths")]
+    pub(crate) fn new(dr: &mut D, value: &Element<'dr, D>) -> Result<Self> {
+        const {
+            assert!(N > 0 && N <= 255, "decomposition width must fit the field");
+        }
+        let bits = FixedVec::try_from_fn(|i| {
+            Boolean::alloc(
+                dr,
+                &mut (),
+                value
+                    .value()
+                    .map(|candidate| candidate.to_le_bits().as_ref()[i]),
+            )
+        })?;
+        let packed = multipack(dr, &bits)?;
+        let recomposed = if N == 255 {
+            let high = packed[1].scale(dr, Coeff::Arbitrary(Fp::from(2).pow_u64(254)));
+            packed[0].add(dr, &high)
+        } else {
+            packed[0].clone()
+        };
+        recomposed.enforce_equal(dr, value)?;
+        let result = Self(bits);
+        if N == 255 {
+            // Only instantiate the width-specific checker for 255 bits.
+            // Cloning the Boolean handles adds no circuit constraints.
+            Bits::<D, 255>(FixedVec::from_fn(|index| result.0[index].clone()))
+                .enforce_canonical(dr)?;
+        }
+        Ok(result)
     }
-    let bits = FixedVec::try_from_fn(|i| {
-        Boolean::alloc(
-            dr,
-            &mut (),
-            value
-                .value()
-                .map(|candidate| candidate.to_le_bits().as_ref()[i]),
-        )
-    })?;
-    let packed = multipack(dr, &bits)?;
-    let recomposed = if N == 255 {
-        let high_weight = Element::constant(dr, Fp::from(2).pow_u64(254));
-        let high = packed[1].mul(dr, &high_weight)?;
-        packed[0].add(dr, &high)
-    } else {
-        packed[0].clone()
-    };
-    recomposed.enforce_equal(dr, value)?;
-    if N == 255 {
+
+    /// The caller supplies a public maximum below 2^N. Both the value and
+    /// `maximum - value` must fit N bits, preventing field wraparound.
+    /// Returns the checked decomposition of `value` for arithmetic consumers.
+    pub(crate) fn bounded(dr: &mut D, value: &Element<'dr, D>, maximum: u64) -> Result<Self> {
+        const {
+            assert!(
+                N > 0 && N <= 64,
+                "bounded integer width must be at most 64 bits"
+            );
+        }
+        let value_bits = Self::new(dr, value)?;
+        let maximum_element = Element::constant(dr, Fp::from(maximum));
+        let slack = maximum_element.sub(dr, value);
+        Self::new(dr, &slack)?;
+        Ok(value_bits)
+    }
+
+    /// Compare the canonical field bits with p-1, sharing a product across each
+    /// maximal zero run. Its sum has at most 254 Boolean terms and cannot wrap.
+    #[expect(clippy::indexing_slicing, reason = "fixed 255-bit canonical encoding")]
+    fn enforce_canonical(&self, dr: &mut D) -> Result<()> {
+        const {
+            assert!(
+                N == 255,
+                "canonical field representation must have 255 bits"
+            );
+        }
+        let bits = &self.0;
         let maximum = (-Fp::ONE).to_le_bits();
-        let mut equal = Element::constant(dr, Fp::ONE);
-        for i in (0..255).rev() {
-            if maximum.as_ref()[i] {
-                equal = equal.mul(dr, &bits[i].element())?;
+        let mut equal = bits[254].element();
+        let mut run = Element::zero(dr);
+        let mut pending = false;
+        for index in (0..254).rev() {
+            if maximum.as_ref()[index] {
+                if pending {
+                    equal.mul(dr, &run)?.enforce_zero(dr)?;
+                    run = Element::zero(dr);
+                    pending = false;
+                }
+                equal = equal.mul(dr, &bits[index].element())?;
             } else {
-                equal.mul(dr, &bits[i].element())?.enforce_zero(dr)?;
+                run = run.add(dr, &bits[index].element());
+                pending = true;
             }
         }
-    }
-    Ok(bits)
-}
-
-/// Bounded unsigned integer: both the value and its slack have N bits.
-/// The caller supplies a public maximum below 2^N; N is at most 64, so
-/// neither side of the slack equation can wrap in the circuit field.
-pub(crate) fn bounded<'dr, D: Driver<'dr, F = Fp>, const N: usize>(
-    dr: &mut D,
-    value: &Element<'dr, D>,
-    maximum: u64,
-) -> Result<()> {
-    const {
-        assert!(
-            N > 0 && N <= 64,
-            "bounded integer width must be at most 64 bits"
-        );
-    }
-    bits::<D, N>(dr, value)?;
-    let maximum_element = Element::constant(dr, Fp::from(maximum));
-    let slack = maximum_element.sub(dr, value);
-    bits::<D, N>(dr, &slack)?;
-    Ok(())
-}
-
-/// A free scalar's canonical bits. It is used only as a blinding witness;
-/// no arithmetic-field embedding of Fq into Fp is assumed.
-#[expect(clippy::indexing_slicing, reason = "fixed 255-bit scalar width")]
-pub(crate) fn scalar_bits<'dr, D: Driver<'dr, F = Fp>>(
-    dr: &mut D,
-    scalar: &DriverValue<D, Fq>,
-) -> Result<FixedVec<Boolean<'dr, D>, ConstLen<255>>> {
-    let bits = FixedVec::try_from_fn(|i| {
-        Boolean::alloc(
-            dr,
-            &mut (),
-            scalar
-                .as_ref()
-                .map(|candidate| candidate.to_le_bits().as_ref()[i]),
-        )
-    })?;
-    let maximum = (-Fq::ONE).to_le_bits();
-    let mut equal = Element::constant(dr, Fp::ONE);
-    for i in (0..255).rev() {
-        if maximum.as_ref()[i] {
-            equal = equal.mul(dr, &bits[i].element())?;
-        } else {
-            equal.mul(dr, &bits[i].element())?.enforce_zero(dr)?;
+        if pending {
+            equal.mul(dr, &run)?.enforce_zero(dr)?;
         }
+        Ok(())
     }
-    Ok(bits)
+}
+
+impl<'dr, D: Driver<'dr, F = Fp>> Bits<'dr, D, 255> {
+    /// Free opening advice: no header or hash binds the integer encoding of
+    /// rcv.
+    #[expect(clippy::indexing_slicing, reason = "native fixed field representation")]
+    pub(crate) fn free(dr: &mut D, value: &DriverValue<D, Fq>) -> Result<Self> {
+        FixedVec::try_from_fn(|index| {
+            Boolean::alloc(
+                dr,
+                &mut (),
+                value
+                    .as_ref()
+                    .map(|candidate| candidate.to_le_bits().as_ref()[index]),
+            )
+        })
+        .map(Self)
+    }
+}
+
+/// A range-checked epoch index inside a circuit.
+pub(crate) struct EpochIndex<'dr, D: Driver<'dr>>(Element<'dr, D>);
+
+impl<'dr, D: Driver<'dr, F = Fp>> EpochIndex<'dr, D> {
+    pub(crate) fn new(dr: &mut D, epoch: &Element<'dr, D>) -> Result<Self> {
+        Bits::<D, 32>::bounded(dr, epoch, u64::from(EPOCH_MAX))?;
+        Ok(Self(epoch.clone()))
+    }
+
+    pub(crate) fn next(&self, dr: &mut D) -> Result<Self> {
+        let one = Element::constant(dr, Fp::ONE);
+        let next = self.0.add(dr, &one);
+        Self::new(dr, &next)
+    }
+
+    /// The native index. Witness generation rejects an out-of-range element,
+    /// as the range check rejects it in the circuit.
+    pub(crate) fn value(&self) -> Result<DriverValue<D, primitives::EpochIndex>> {
+        D::try_just(|| {
+            primitives::EpochIndex::try_from(*self.0.value().take())
+                .map_err(|_err| ragu_core::Error::InvalidWitness("epoch index out of range".into()))
+        })
+    }
+
+    pub(crate) fn into_element(self) -> Element<'dr, D> {
+        self.0
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use ragu_primitives::Simulator;
-
-    use super::*;
-    use crate::{
-        constants::{EPOCH_MAX, MAX_MONEY},
-        nullifier::NF_DERIVATION_WIDTH,
-    };
-    fn check_nonzero_output_boundary() {
-        for assignment in [Fp::ZERO, Fp::ONE, -Fp::ONE] {
-            let result = Simulator::<Fp>::simulate(assignment, |driver, supplied| {
-                let element = Element::alloc(driver, &mut (), supplied)?;
-                element.enforce_nonzero(driver)?;
-                Ok(())
-            });
-            assert_eq!(result.is_ok(), assignment != Fp::ZERO);
-        }
-    }
-    #[test]
-    fn spend_current_nullifier_rejects_raw_zero_at_the_nonzero_boundary() {
-        // B39: a whole-step zero requires a Poseidon preimage; isolate the
-        // actual public nonzero gadget instead of weakening the hash relation.
-        check_nonzero_output_boundary();
-    }
-    #[test]
-    fn spend_next_nullifier_rejects_raw_zero_at_the_nonzero_boundary() {
-        // B40: producing a whole-step zero requires a Poseidon preimage.
-        // This deliberately tests only the nonzero allocation boundary.
-        check_nonzero_output_boundary();
-    }
-    #[test]
-    fn output_commitment_rejects_raw_zero_at_the_nonzero_boundary() {
-        // B42: the full note hash is not replaced to manufacture a zero;
-        // finding that whole-step witness would require a Poseidon preimage.
-        check_nonzero_output_boundary();
-    }
-    #[test]
-    fn output_padding_rejects_raw_zero_at_the_nonzero_boundary() {
-        // B43: a zero padding hash needs a Poseidon preimage. This test
-        // supplies raw zero only at the actual nonzero gadget boundary.
-        check_nonzero_output_boundary();
-    }
-    #[test]
-    fn fee_fuse_change_rejects_raw_zero_at_the_nonzero_boundary() {
-        // B49: whole-step zero requires a Poseidon preimage; the range and
-        // hash constraints remain intact while this boundary is tested.
-        check_nonzero_output_boundary();
-    }
-    #[test]
-    fn fee_seed_change_rejects_raw_zero_at_the_nonzero_boundary() {
-        // B51: constructing a zero change commitment requires a Poseidon
-        // preimage. Scope is the nonzero gadget, not a whole-step forgery.
-        check_nonzero_output_boundary();
-    }
-    #[test]
-    fn bounded_amount_rejects_raw_out_of_range_assignments() {
-        for native_amount in [Fp::ZERO, Fp::from(MAX_MONEY)] {
-            Simulator::<Fp>::simulate(native_amount, |dr, assignment| {
-                let amount = Element::alloc(dr, &mut (), assignment)?;
-                bounded::<_, 51>(dr, &amount, MAX_MONEY)
-            })
-            .expect("valid amount");
-        }
-        for native_amount in [-Fp::ONE, Fp::from(MAX_MONEY + 1), Fp::from(2).pow_u64(51)] {
-            assert!(
-                Simulator::<Fp>::simulate(native_amount, |dr, assignment| {
-                    let amount = Element::alloc(dr, &mut (), assignment)?;
-                    bounded::<_, 51>(dr, &amount, MAX_MONEY)
-                })
-                .is_err()
-            );
-        }
-    }
-    #[test]
-    fn one_bit_decomposition_rejects_raw_nonboolean_field_assignments() {
-        // Rust bool cannot carry 2 or -1. Exercise the Boolean allocation and
-        // recomposition boundary with a raw field assignment instead.
-        for assignment in [Fp::ZERO, Fp::ONE, Fp::from(2), -Fp::ONE] {
-            let result = Simulator::<Fp>::simulate(assignment, |driver, supplied| {
-                let element = Element::alloc(driver, &mut (), supplied)?;
-                bits::<_, 1>(driver, &element)?;
-                Ok(())
-            });
-            assert_eq!(
-                result.is_ok(),
-                assignment == Fp::ZERO || assignment == Fp::ONE
-            );
-        }
-    }
-    #[test]
-    fn nullifier_window_end_rejects_raw_overflow_before_header_conversion() {
-        // An out-of-domain end cannot be represented by native EpochIndex.
-        // Test the actual driver arithmetic/range boundary before marshaling.
-        let width = u32::try_from(NF_DERIVATION_WIDTH - 1).expect("fixed window width");
-        let last_start = EPOCH_MAX - width;
-        for raw_start in [last_start, EPOCH_MAX - 3] {
-            let result =
-                Simulator::<Fp>::simulate(Fp::from(u64::from(raw_start)), |driver, supplied| {
-                    let start_element = Element::alloc(driver, &mut (), supplied)?;
-                    bits::<_, 32>(driver, &start_element)?;
-                    let offset = Element::constant(driver, Fp::from(u64::from(width)));
-                    let end = start_element.add(driver, &offset);
-                    bounded::<_, 32>(driver, &end, u64::from(EPOCH_MAX))
-                });
-            assert_eq!(result.is_ok(), raw_start == last_start);
-        }
-    }
-}
+mod tests;

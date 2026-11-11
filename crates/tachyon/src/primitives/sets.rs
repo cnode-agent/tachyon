@@ -2,23 +2,39 @@ use core::iter;
 
 use corez::io::{self, Read, Write};
 use derive_more::{AsRef, Debug, Eq as TotalEq, From, Into, PartialEq};
-use ragu::{Cycle as _, FixedGenerators as _, pasta::Pasta};
 use ragu_circuits::polynomials::{ProductionRank, sparse::Polynomial};
+use ragu_core::{Cycle as _, FixedGenerators as _, pasta::Pasta};
 use udon::curve::Projective as _;
 
 use super::{ActionDigest, Anchor, Tachygram};
 use crate::{
     collections::multiset,
     pasta,
-    pasta::{Eq, Fp},
+    pasta::{EpAffine, Eq, Fp},
     serialization,
+    stamp::proof::PROOF_SYSTEM,
 };
 
 /// Pedersen commitment to a stamp's tachygram set.
 #[derive(AsRef, Clone, Copy, Debug, From, Into, PartialEq, TotalEq)]
 pub struct TachygramSetCommit(Eq);
 
+/// Bridge hash of a tachygram-set commitment: a Pallas point.
+#[derive(Clone, Copy, Debug, From, Into, PartialEq, TotalEq)]
+pub struct TachygramSetBridge(EpAffine);
+
 impl TachygramSetCommit {
+    /// Hashes this commitment through the application's bridge-hash stage.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the commitment is the identity.
+    pub fn bridge(self) -> ragu_core::Result<TachygramSetBridge> {
+        Ok(TachygramSetBridge(
+            PROOF_SYSTEM.bridge_hash(self.0.to_affine())?,
+        ))
+    }
+
     /// Read as an affine point from the consensus wire format.
     ///
     /// # Errors
@@ -115,7 +131,7 @@ pub struct ActionSetPoly(Polynomial<Fp, ProductionRank>);
 
 /// Witness polynomial for an anchor span's member set (members encoded as
 /// roots).
-#[derive(AsRef, Clone, Debug, From, Into)]
+#[derive(AsRef, Clone, Debug, Into)]
 pub struct AnchorSetPoly(Polynomial<Fp, ProductionRank>);
 
 impl AnchorSetPoly {
@@ -175,21 +191,5 @@ impl FromIterator<ActionDigest> for ActionSetPoly {
 impl FromIterator<Tachygram> for TachygramSetPoly {
     fn from_iter<I: IntoIterator<Item = Tachygram>>(iter: I) -> Self {
         Self(multiset::encode(iter.into_iter().map(Fp::from)))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use rand::{SeedableRng as _, rngs::StdRng};
-
-    use super::*;
-
-    #[test]
-    fn singleton_commits_to_the_one_member_set() {
-        let anchor = Anchor::random(&mut StdRng::seed_from_u64(0));
-        assert_eq!(
-            AnchorSetCommit::singleton(anchor),
-            AnchorSetPoly::from_iter([anchor]).commit()
-        );
     }
 }

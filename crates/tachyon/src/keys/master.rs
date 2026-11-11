@@ -3,11 +3,7 @@
 use core::array;
 
 use derive_more::{Debug, Eq as TotalEq, Into, PartialEq};
-use ragu::{PoseidonPermutation as _, pasta::PoseidonFp};
-#[cfg(test)]
-use rand_core::CryptoRng;
-#[cfg(test)]
-use udon::field::Field as _;
+use ragu_core::{PoseidonPermutation as _, pasta::PoseidonFp};
 
 use crate::{
     digest::poseidon,
@@ -29,11 +25,6 @@ use crate::{
 pub struct NoteMasterKey(#[debug(skip)] pub(crate) Fp);
 
 impl NoteMasterKey {
-    #[cfg(test)]
-    pub(crate) fn random<RNG: CryptoRng>(rng: &mut RNG) -> Self {
-        Self(Fp::random(|bytes| rng.fill_bytes(bytes)))
-    }
-
     /// Derive the nullifier for a single epoch.
     #[must_use]
     #[expect(
@@ -61,7 +52,8 @@ impl NoteMasterKey {
     ///
     /// # Panics
     ///
-    /// If the window would run past [`EPOCH_MAX`](crate::constants::EPOCH_MAX).
+    /// If `epoch_start` is not group-aligned, or the window would run past
+    /// [`EPOCH_MAX`](crate::constants::EPOCH_MAX).
     #[must_use]
     #[expect(
         clippy::as_conversions,
@@ -72,7 +64,7 @@ impl NoteMasterKey {
         reason = "both widths are small powers of two and divide exactly"
     )]
     pub fn derive_window(&self, epoch_start: EpochIndex) -> [Nullifier; NF_DERIVATION_WIDTH] {
-        debug_assert_eq!(
+        assert_eq!(
             u32::from(epoch_start) % (PoseidonFp::RATE as u32),
             0,
             "epoch_start must be group-aligned"

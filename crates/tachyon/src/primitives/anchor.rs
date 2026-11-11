@@ -60,8 +60,8 @@ impl Anchor {
     ///
     /// # Errors
     ///
-    /// Fails if `stamp_commit` is the identity point or a commitment to an
-    /// empty set.
+    /// Fails if the commitment is the identity, or if the tachygram set is
+    /// empty.
     pub fn next_stamp(
         self,
         epoch: EpochIndex,
@@ -72,10 +72,13 @@ impl Anchor {
         } else if stamp_commit == TachygramSetCommit::default() {
             Err(AnchorError::NextStampEmpty)
         } else {
+            let stamp_hash = stamp_commit
+                .bridge()
+                .map_err(|_err| AnchorError::NextStampZero)?;
             Ok(Self(poseidon::anchor_next_stamp(
                 self.0,
                 epoch.into(),
-                stamp_commit.as_ref().to_affine(),
+                stamp_hash.into(),
             )))
         }
     }
@@ -123,92 +126,4 @@ impl Default for Anchor {
 }
 
 #[cfg(test)]
-mod tests {
-    use ff::{Field as _, PrimeField as _};
-    use pasta_curves::Fp as LegacyFp;
-    use rand::{SeedableRng as _, rngs::StdRng};
-
-    use super::*;
-    use crate::{Tachygram, TachygramSetPoly, pasta::Eq};
-
-    #[test]
-    fn anchor_order_matches_legacy_field_order() {
-        let legacy_values = [
-            LegacyFp::ZERO,
-            LegacyFp::ONE,
-            LegacyFp::from(256),
-            -LegacyFp::ONE,
-        ];
-        for left in legacy_values {
-            for right in legacy_values {
-                let current_left = Fp::from_bytes(left.to_repr())
-                    .expect("canonical legacy anchor bytes decode in Udon");
-                let current_right = Fp::from_bytes(right.to_repr())
-                    .expect("canonical legacy anchor bytes decode in Udon");
-                assert_eq!(
-                    Anchor(current_left).cmp(&Anchor(current_right)),
-                    left.cmp(&right)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn order_matters() {
-        let rng = &mut StdRng::seed_from_u64(0);
-        let first = TachygramSetPoly::from_iter([Tachygram::random(&mut *rng)]).commit();
-        let second = TachygramSetPoly::from_iter([Tachygram::random(&mut *rng)]).commit();
-
-        let forward = Anchor::default()
-            .next_stamp(EpochIndex::new(7), &first)
-            .unwrap()
-            .next_stamp(EpochIndex::new(7), &second)
-            .unwrap();
-
-        let reverse = Anchor::default()
-            .next_stamp(EpochIndex::new(7), &second)
-            .unwrap()
-            .next_stamp(EpochIndex::new(7), &first)
-            .unwrap();
-
-        assert_ne!(forward, reverse);
-    }
-
-    #[test]
-    fn next_stamp_rejects_invalid_sets() {
-        let rng = &mut StdRng::seed_from_u64(0);
-
-        // The identity commitment is not a valid set
-        {
-            let anchor = Anchor::random(rng);
-            let zero_set = TachygramSetCommit::from(Eq::identity());
-
-            let Err(AnchorError::NextStampZero) = anchor.next_stamp(EpochIndex::new(7), &zero_set)
-            else {
-                panic!("should not be able to advance with an identity stamp");
-            };
-        }
-
-        // An empty set commits to a constant polynomial
-        {
-            let anchor = Anchor::random(rng);
-            let one_set = TachygramSetCommit::default();
-
-            let Err(AnchorError::NextStampEmpty) = anchor.next_stamp(EpochIndex::new(1), &one_set)
-            else {
-                panic!("should not be able to advance with an empty stamp");
-            };
-        }
-    }
-
-    #[test]
-    fn next_epoch_rejects_epoch_zero() {
-        let rng = &mut StdRng::seed_from_u64(0);
-
-        let anchor = Anchor::random(rng);
-
-        let Err(AnchorError::NextEpochZero) = anchor.next_epoch(EpochIndex::new(0)) else {
-            panic!("should not be able to advance to epoch zero");
-        };
-    }
-}
+mod tests;

@@ -3,9 +3,6 @@
 use core::{cmp, ops, ops::Neg as _};
 
 use derive_more::{Add, Debug, Display, Eq as TotalEq, Error, From, Into, PartialEq, Sub, Sum};
-use group::GroupEncoding as _;
-use lazy_static::lazy_static;
-use pasta_curves::{arithmetic::CurveExt as _, pallas::Point};
 use rand_core::CryptoRng;
 use udon::{
     curve::{Affine as _, Projective as _},
@@ -13,7 +10,10 @@ use udon::{
 };
 
 use crate::{
-    constants::MAX_MONEY,
+    constants::{
+        MAX_MONEY,
+        orchard::{VALUE_COMMIT_R, VALUE_COMMIT_V},
+    },
     pasta::{Ep, EpAffine, Fq},
 };
 
@@ -32,27 +32,6 @@ pub type Positive = Value<0, { MAX_MONEY.cast_signed() }>;
 /// A non-positive integer not less than `-MAX_MONEY`.
 pub type Negative = Value<{ -MAX_MONEY.cast_signed() }, 0>;
 
-/// Shared with Orchard (§5.4.8.3).
-const VALUE_COMMITMENT_DOMAIN: &str = "z.cash:Orchard-cv";
-
-lazy_static! {
-    /// Generator $\mathcal{V}$ for value commitments.
-    pub(crate) static ref VALUE_COMMIT_V: Ep = {
-        #[expect(clippy::expect_used, reason = "the fixed generator has a canonical encoding")]
-        EpAffine::from_bytes(Point::hash_to_curve(VALUE_COMMITMENT_DOMAIN)(b"v").to_bytes())
-            .expect("valid Orchard generator")
-            .to_projective()
-    };
-
-    /// Generator $\mathcal{R}$ for value commitments and binding signatures.
-    pub(crate) static ref VALUE_COMMIT_R: Ep = {
-        #[expect(clippy::expect_used, reason = "the fixed generator has a canonical encoding")]
-        EpAffine::from_bytes(Point::hash_to_curve(VALUE_COMMITMENT_DOMAIN)(b"r").to_bytes())
-            .expect("valid Orchard generator")
-            .to_projective()
-    };
-}
-
 /// Entropy for a value commitment.
 ///
 /// Each action gets a fresh trapdoor, to commit its value secretly.
@@ -69,9 +48,14 @@ impl Trapdoor {
     /// The zero trapdoor.
     pub const ZERO: Self = Self(Fq::ZERO);
 
-    /// Generate a random trapdoor.
+    /// Generate a nonzero random trapdoor for an action.
     pub fn random<RNG: CryptoRng>(rng: &mut RNG) -> Self {
-        Self(Fq::random(|bytes| rng.fill_bytes(bytes)))
+        loop {
+            let scalar = Fq::random(|bytes| rng.fill_bytes(bytes));
+            if scalar != Fq::ZERO {
+                return Self(scalar);
+            }
+        }
     }
 
     /// A trapdoor derived from other secret data, such as a max fee note's
@@ -276,66 +260,4 @@ impl ops::Neg for Positive {
 }
 
 #[cfg(test)]
-mod tests {
-    use rand::{SeedableRng as _, rngs::StdRng};
-
-    use super::*;
-
-    #[test]
-    fn balance_zero_is_identity() {
-        assert_eq!(Trapdoor::ZERO.commit(Balance::ZERO), Commitment::default());
-    }
-
-    #[test]
-    fn value_commitment_matches_legacy_orchard_generators_and_scalar_bytes() {
-        use ff::PrimeField as _;
-        use group::Curve as _;
-        use pasta_curves::Fq as LegacyFq;
-
-        const LEGACY_VALUE_COMMITMENT_DOMAIN: &str = "z.cash:Orchard-cv";
-
-        let trapdoor = Trapdoor::from_scalar(Fq::from(29));
-        let value = Balance::try_from(-11).unwrap();
-        let current_bytes: [u8; 32] = trapdoor.commit(value).into();
-        let legacy_randomness = LegacyFq::from_repr(trapdoor.0.to_bytes())
-            .into_option()
-            .expect("canonical Udon randomness bytes decode in legacy Fq");
-        let legacy_value = -LegacyFq::from(11u64);
-        let legacy_value_generator = Point::hash_to_curve(LEGACY_VALUE_COMMITMENT_DOMAIN)(b"v");
-        let legacy_randomness_generator =
-            Point::hash_to_curve(LEGACY_VALUE_COMMITMENT_DOMAIN)(b"r");
-        let legacy_commitment =
-            legacy_value_generator * legacy_value + legacy_randomness_generator * legacy_randomness;
-
-        assert_eq!(legacy_commitment.to_affine().to_bytes(), current_bytes);
-    }
-
-    /// The binding property: `cv_a + cv_b - balance(a+b) = [rcv_a + rcv_b]R`.
-    /// The V-components cancel, leaving only the R-component.
-    #[test]
-    fn commit_homomorphic_binding_property() {
-        let rng = &mut StdRng::seed_from_u64(0);
-        let rcv_a = Trapdoor::random(rng);
-        let cv_a = rcv_a.commit(Balance::try_from(100).unwrap());
-        let rcv_b = Trapdoor::random(rng);
-        let cv_b = rcv_b.commit(Balance::try_from(200).unwrap());
-
-        let remainder = cv_a + cv_b - Trapdoor::ZERO.commit(Balance::try_from(300).unwrap());
-
-        let rcv_sum: Fq = Into::<Fq>::into(rcv_a) + Into::<Fq>::into(rcv_b);
-
-        assert_eq!(remainder, ValueCommitment(*VALUE_COMMIT_R * rcv_sum));
-    }
-
-    #[test]
-    fn debug_value_trapdoor_redacts_scalar() {
-        let rcv = ValueTrapdoor(Fq::from(0xFACEu64));
-        assert_eq!(alloc::format!("{rcv:?}"), "ValueTrapdoor(..)");
-    }
-
-    #[test]
-    fn debug_value_commitment_redacts_point() {
-        let cv = Trapdoor::ZERO.commit(Balance::try_from(100).unwrap());
-        assert_eq!(alloc::format!("{cv:?}"), "ValueCommitment(..)");
-    }
-}
+mod tests;

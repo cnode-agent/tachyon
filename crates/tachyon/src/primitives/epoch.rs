@@ -1,6 +1,7 @@
 use core::ops;
 
-use derive_more::{Debug, Eq as TotalEq, Into, PartialEq};
+use derive_more::{Debug, Display, Eq as TotalEq, Error, Into, PartialEq};
+use udon::field::Field as _;
 
 use super::BlockHeight;
 use crate::{
@@ -13,14 +14,21 @@ use crate::{
 /// The tachyon accumulator evolves as tachygrams are included. Each
 /// epoch identifies a specific pool accumulator state.
 ///
-/// Indexes nullifier derivation: $mk = \text{KDF}(\psi, nk)$, then
-/// $nf_e = F_{mk}(e)$. Different epochs produce different nullifiers for
-/// the same note, enabling range-restricted delegation via the GGM tree PRF.
+/// Indexes nullifier derivation. A note's nullifier for an epoch is a squeeze
+/// of the Poseidon sponge keyed on the note's master key $\mathsf{mk}$ and the
+/// epoch's group start. Different epochs produce different nullifiers for the
+/// same note. A wallet delegates a window of epochs by handing out that
+/// window's nullifiers.
 ///
 /// Always in `0..=EPOCH_MAX`: every index maps to a block height in the
 /// protocol's range.
 #[derive(Clone, Copy, Debug, Into, Ord, PartialEq, PartialOrd, TotalEq)]
 pub struct EpochIndex(u32);
+
+/// A field element outside the epoch-index range.
+#[derive(Clone, Copy, Debug, Display, Error)]
+#[display("field element is not a valid epoch index")]
+pub struct EpochIndexError;
 
 /// A non-negative distance between two [`EpochIndex`]es, from subtraction.
 #[derive(Clone, Copy, Debug, Into, Ord, PartialEq, PartialOrd, TotalEq)]
@@ -80,6 +88,20 @@ impl From<EpochIndex> for Fp {
     }
 }
 
+impl TryFrom<Fp> for EpochIndex {
+    type Error = EpochIndexError;
+
+    fn try_from(value: Fp) -> Result<Self, Self::Error> {
+        let [first, second, third, fourth, ..] = value.to_bytes();
+        let index = u32::from_le_bytes([first, second, third, fourth]);
+        if index <= EPOCH_MAX && value == Fp::from(u64::from(index)) {
+            Ok(Self(index))
+        } else {
+            Err(EpochIndexError)
+        }
+    }
+}
+
 impl ops::Sub<Self> for EpochIndex {
     type Output = EpochDiff;
 
@@ -94,43 +116,4 @@ impl ops::Sub<Self> for EpochIndex {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn epoch_difference_counts_the_span() {
-        assert_eq!(u64::from(EpochIndex(7) - EpochIndex(3)), 4);
-        assert_eq!(u64::from(EpochIndex(3) - EpochIndex(3)), 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "epoch difference is positive")]
-    fn epoch_difference_rejects_reversed_operands() {
-        let reversed = EpochIndex(3) - EpochIndex(7);
-        panic!("reversed operands must not produce a difference, got {reversed:?}");
-    }
-
-    #[test]
-    #[should_panic(expected = "epoch index above EPOCH_MAX")]
-    fn new_rejects_an_index_past_the_final_epoch() {
-        let past_the_end = EpochIndex::new(EPOCH_MAX + 1);
-        panic!("an index above EPOCH_MAX is not an epoch, got {past_the_end:?}");
-    }
-
-    #[test]
-    fn final_epoch_ends_at_the_final_block() {
-        use crate::constants::BLOCK_MAX;
-
-        assert_eq!(EpochIndex(EPOCH_MAX).last_block(), BlockHeight(BLOCK_MAX));
-        assert_eq!(BlockHeight(BLOCK_MAX).epoch(), EpochIndex(EPOCH_MAX));
-    }
-
-    #[test]
-    fn next_stops_at_the_final_epoch() {
-        assert_eq!(
-            EpochIndex(EPOCH_MAX - 1).next(),
-            Some(EpochIndex(EPOCH_MAX))
-        );
-        assert_eq!(EpochIndex(EPOCH_MAX).next(), None);
-    }
-}
+mod tests;
